@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from m_learning.models.layers import GRN
 
+# Handling of static covariates is a key part of the TFT model. The static covariates are used to condition the model on tenant identity, which allows the model to learn tenant-specific patterns and improve its predictions. The StaticCovariateEncoder class is responsible for encoding the static covariates into context vectors that can be used by the rest of the model. The context vectors are generated using embedding layers and GRN layers, which allow the model to learn complex relationships between the static covariates and the target variable.
+
 
 class StaticCovariateEncoder(nn.Module):
     """

@@ -102,6 +102,7 @@ def load_events(
         # One connection per connector. Sharing one would let a single failing
         # query abort the transaction and take every later connector down with
         # it — which reads identically to "this tenant has no data".
+        # Connect to the database and execute the query, catching any exceptions that may occur. If an exception occurs, log a warning and continue to the next query. If the query returns any results, append them to the list of frames.
         try:
             with engine.connect() as conn:
                 part = pd.read_sql(

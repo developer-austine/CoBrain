@@ -36,7 +36,7 @@ def attach_text_features(df, weekly_embeddings: dict, weekly_sentiments: dict):
     weekly_sentiments : {week -> list[float]}
 
     The baseline is advanced strictly forward in time, so a week's drift is
-    measured against only the weeks before it.
+    measured against only the weeks before it. Whatever happens next week does not affect the current week's drift. This is important for the model to learn the actual drift of a week, and not be influenced by future weeks. The baseline is updated only if there are embeddings for the current week, so that weeks with no messages do not affect the baseline. This ensures that the baseline is always based on actual data and not on missing data.
     """
     import pandas as pd
 

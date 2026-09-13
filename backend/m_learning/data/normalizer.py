@@ -14,7 +14,9 @@ def _non_negative(series: pd.Series) -> pd.Series:
     log1p of a negative is NaN, and the fillna at the end of transform() would
     turn that into a silent 0.0 — the model would train on fabricated zeros with
     no error anywhere. Clipping cannot alter a valid count and makes the corrupt
-    case impossible.
+    case impossible. 
+
+    This use case logs the actual credibility of a file and works on it as it is with the normalizer. The model will learn to ignore the negative values and treat them as outliers, rather than silently turning them into zeros.
     """
     return series.fillna(0).clip(lower=0)
 

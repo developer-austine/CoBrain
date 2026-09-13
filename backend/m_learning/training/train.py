@@ -25,6 +25,7 @@ def load_series(store: FeatureStore, tenant_ids: list[str] | None) -> list[Tenan
         meta = store.read_meta(tenant_id)
         # Rule 6: statistics come from the training window only. The holdout is
         # the last HORIZON weeks, so the fit ends before it starts.
+        # The training window is the first N-HORIZON weeks, so the fit ends before it starts.
         train_end = frame.index[max(len(frame) - CFG.HORIZON, 1) - 1]
         normalised = TenantNormalizer().fit(frame, train_end).transform(frame)
 

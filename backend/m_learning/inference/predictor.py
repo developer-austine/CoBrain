@@ -1,5 +1,7 @@
 """Load checkpoint, run forecast."""
 
+#This file main purpose is to load the model checkpoint and run the forecast for a given tenant. It uses the Predictor class to make predictions based on the input data and tenant profile. The output is a Forecast object that contains the predicted quantiles, weeks, and other relevant information.
+
 from __future__ import annotations
 
 from dataclasses import dataclass

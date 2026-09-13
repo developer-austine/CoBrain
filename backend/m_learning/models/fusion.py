@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+# I linearlize the input features and then use a variable selection network to select the most relevant features for the task at hand. The selected features are then passed through an LSTM layer to capture the temporal dependencies in the data. The output of the LSTM is then enriched with static context vectors and passed through a multi-head attention mechanism to capture long-range dependencies. Finally, the output is normalized and returned along with the variable weights and attention weights for interpretability.
 
 class FusionEngine(nn.Module):
     """
