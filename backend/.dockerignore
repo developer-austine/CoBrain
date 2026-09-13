@@ -1,0 +1,27 @@
+# Host Python virtualenv — never ship to the daemon or copy into the image (1.8GB)
+venv/
+.venv/
+env/
+
+# Python caches / build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# C++ build output
+cpp/build/
+*.so
+*.o
+*.obj
+
+# Celery beat local schedule files
+celerybeat-schedule*
+
+# Misc
+.git/
+.env
+*.log
+.DS_Store

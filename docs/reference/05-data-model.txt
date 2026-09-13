@@ -1,0 +1,140 @@
+# 05 · Data Model
+
+Schema: [`prisma/schema.prisma`](../prisma/schema.prisma). **Prisma owns the
+schema** — Python reads and writes these tables but never migrates them.
+
+> **Two databases.** Better Auth uses `AUTH_DATABASE_URL` (its own Postgres,
+> typically Neon). Everything below lives in `DATABASE_URL` (the Docker
+> Postgres). `userId` is the string key that joins them; there is no FK across
+> the boundary.
+
+## Entity map
+
+```mermaid
+erDiagram
+    Workflow ||--o{ WorkflowExecution : runs
+    Workflow ||--o{ WorkflowLink : "source/target"
+    WorkflowExecution ||--o{ ExecutionPhase : phases
+
+    Workflow ||--o{ GmailConnection : has
+    Workflow ||--o{ NotionConnection : has
+    Workflow ||--o{ GitHubConnection : has
+    Workflow ||--o{ CustomConnection : has
+
+    GmailConnection  ||--o{ Email : ingests
+    NotionConnection ||--o{ NotionPage : ingests
+    GitHubConnection ||--o{ GitHubItem : ingests
+    CustomConnection ||--o{ CustomDocument : ingests
+
+    ChatConversation ||--o{ ChatMessage : contains
+```
+
+Standalone (no FK, scoped by `userId`): `SourceFile`, `BrainBlock`,
+`AgentConfig`, `PromptEvent`, `CompanyProfile`.
+
+## The ingestion tables
+
+All four connector item tables + `SourceFile` share the **same status contract**,
+which is what lets the pipeline and UI treat them uniformly:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `status` | String | `PENDING` → `QUEUED` → `PROCESSED` \| `FAILED` |
+| `queuedAt` | DateTime? | Pushed to Redis |
+| `processedAt` | DateTime? | Pipeline finished |
+| `errorMessage` | String? | Failure reason |
+
+| Table | Source key | Citation link |
+|-------|-----------|---------------|
+| `Email` | `gmail` | Gmail deep link via `gmailMessageId` |
+| `NotionPage` | `notion` | `url` |
+| `GitHubItem` | `github` | `url` |
+| `CustomDocument` | `custom` | none |
+| `SourceFile` | `upload` | `/api/sources/{id}/download` |
+| `BrainBlock` | `brain` | `/brain?block={id}` |
+
+The `id` of these rows **is** the `parent_doc_id` in the Qdrant payload. That is
+the entire citation mechanism.
+
+## Key models
+
+### `SourceFile` — an uploaded document
+
+```prisma
+id, userId, fileName, mimeType,
+storageKey,        // MinIO object key: {userId}/{uuid}-{safeName}
+sizeBytes,
+status,            // PENDING → QUEUED → PROCESSED | FAILED
+extractedChars,    // how much text we got (0 ⇒ likely a scan needing OCR)
+errorMessage, scope,
+createdAt, queuedAt, processedAt
+@@index([userId, status])
+```
+
+Bytes live in **MinIO**, not Postgres. Deleting the row also removes the object.
+
+### `BrainBlock` — derived knowledge
+
+```prisma
+id, userId,
+type,        // meeting_summary | forecast | learned_fact | pattern | decision | brief | note
+title, body, // body is Markdown, rendered on the Brain page
+data,        // structured facts, e.g. { assignments: [{ task, owner, why, when, doc }] }
+sourceRefs,  // PROVENANCE: [{ kind, source, docId, title, url }]
+confidence,  // 0–1
+createdBy,   // "ai" | "human"
+status       // "active" | "queued_for_review"
+```
+
+- `status = "active"` ⇒ live on the page **and** dual-written to Qdrant
+  (`source: "brain"`), so it becomes citable knowledge.
+- `status = "queued_for_review"` ⇒ **not** embedded. AI writes below the
+  confidence gate (0.7) cannot become knowledge until a human approves.
+- `sourceRefs` is why nothing on the Brain is unattributable.
+
+### `WorkflowLink` — knowledge flow between workflows
+
+```prisma
+id, userId,
+sourceWorkflowId,  // knowledge flows FROM here
+targetWorkflowId,  // ...TO here (target may search source's knowledge)
+@@unique([sourceWorkflowId, targetWorkflowId])
+```
+
+Transitive and **must stay acyclic** — `canLink()` in
+[`lib/workflow/knowledgeScope.ts`](../lib/workflow/knowledgeScope.ts) refuses
+self-links, duplicates and cycles at write time.
+
+### `PromptEvent` — the audit trail
+
+Every prompt is recorded: `rawText`, `references`, `intent`, `model`,
+`inputMethod` (`typed` | `voice`). Written fire-and-forget so an audit failure
+never blocks a user.
+
+### `AgentConfig` — a standing rule
+
+Created by `CONFIG` intent ("always summarise meetings I miss"). Fired by
+`rulesEngine.ts` on a `DomainEvent`.
+
+## Migrations
+
+```bash
+pnpm exec prisma migrate dev --name your_change --schema=./prisma/schema.prisma
+pnpm exec prisma generate       # client → lib/generated/prisma/
+```
+
+> The `--schema` flag is required — this project keeps the schema in `prisma/`
+> and Prisma 7 does not infer it here.
+
+**Production:** `prisma migrate deploy` runs in its own `migrate` service in
+`docker-compose.prod.yml`, and the app waits for it to complete.
+
+### Adding a field Python writes to
+
+1. Add it in `schema.prisma`, migrate, generate.
+2. Update `table_map` / the UPDATE statements in
+   `backend/python/db/postgres_client.py`.
+3. `docker compose restart ingest search-api worker`.
+
+Python uses raw SQL with **quoted camelCase** column names (`"queuedAt"`), because
+Prisma does not snake_case them.

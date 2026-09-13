@@ -1,0 +1,686 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+/**
+ * Auth screens are always light, independent of the app theme (and of the
+ * system/deployment default). Re-declaring the light design tokens on this
+ * subtree makes every theme-variable-based component (Button, Input, ...)
+ * render light even when `.dark` is set on <html>. Keep values in sync with
+ * the `:root` block above.
+ */
+.auth-light {
+  color-scheme: light;
+  /* Re-anchor the inherited text color to the light foreground so components
+     that rely on inherited `color` (e.g. the outline OAuth button label) stay
+     dark-on-white instead of inheriting body's dark-theme light color. */
+  color: var(--foreground);
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+}
+
+/* Voice input: the listening pill's waveform (see components/chat/VoicePill). */
+@keyframes cobrain-listen {
+  0%, 100% { transform: scaleY(1);   opacity: 0.55; }
+  50%      { transform: scaleY(2.8); opacity: 1; }
+}
+
+/* Pre-connection: a gentler breathe while the socket opens. */
+@keyframes cobrain-pulse {
+  0%, 100% { transform: scaleY(1);   opacity: 0.3; }
+  50%      { transform: scaleY(1.6); opacity: 0.7; }
+}
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 240 10% 3.9%;
+    --primary: 142.1 76.2% 36.3%;
+    --primary-foreground: 355.7 100% 97.3%;
+    --secondary: 240 4.8% 95.9%;
+    --secondary-foreground: 240 5.9% 10%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 142.1 76.2% 36.3%;
+    --radius: 0.5rem;
+    --chart-1: 142 88% 28%;
+    --chart-2: 140 74% 44%;
+  }
+
+  .dark {
+    --background: 20 14.3% 4.1%;
+    --foreground: 0 0% 95%;
+    --card: 24 9.8% 10%;
+    --card-foreground: 0 0% 95%;
+    --popover: 0 0% 9%;
+    --popover-foreground: 0 0% 95%;
+    --primary: 142.1 70.6% 45.3%;
+    --primary-foreground: 144.9 80.4% 10%;
+    --secondary: 240 3.7% 15.9%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 0 0% 15%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 12 6.5% 15.1%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 85.7% 97.3%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 142.4 71.8% 29.2%;
+    --chart-1: 142 88% 28%;
+    --chart-2: 140 74% 44%;
+  }
+}
+
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+.react-flow__attribution {
+  background: transparent !important;
+}
+
+.dark {
+  .react-flow__controls-button {
+    @apply !bg-accent;
+  }
+}
+/* ==========================================================================
+   Forecasts design system — docs/refactor/design_tft_ui.txt
+   One semantic vocabulary, two value sets. Components reference ONLY the
+   semantic names; a hardcoded colour in a component is a bug.
+   ========================================================================== */
+
+:root,
+[data-theme="light"] {
+  /* surfaces */
+  --bg-page:        #F7F8FB;
+  --bg-card:        #FFFFFF;
+  --bg-inset:       #F1F3F8;
+  --bg-selected:    #EEEDFB;
+  --border:         rgba(15, 23, 42, 0.08);
+  --border-strong:  rgba(15, 23, 42, 0.14);
+
+  /* text */
+  --text-primary:   #0F172A;
+  --text-secondary: #55607A;
+  --text-muted:     #8B94A8;
+
+  /* brand + semantics */
+  --accent:         #6D5EF0;
+  --accent-soft:    rgba(109, 94, 240, 0.14);
+  --teal:           #0FA88C;
+  --coral:          #E0483F;
+  --amber:          #D98A0B;
+  --ice:            #4C7DD8;
+
+  /* chart */
+  --chart-observed:      #9AA3B5;
+  --chart-observed-dot:  #6B7488;
+  --chart-p50:           #6D5EF0;
+  --chart-band:          rgba(109, 94, 240, 0.16);
+  --chart-band-edge:     rgba(109, 94, 240, 0.34);
+  --chart-grid:          rgba(15, 23, 42, 0.06);
+  --chart-divider:       rgba(15, 23, 42, 0.28);
+  --chart-crosshair:     rgba(15, 23, 42, 0.35);
+  --pulse-core:          #6D5EF0;
+  --pulse-halo:          rgba(109, 94, 240, 0.35);
+
+  /* ── interpretation layer (forecast-drawer spec §2) ─────────────────── */
+  --interp-hero-border:   #6D5EF0;
+  --interp-hero-shadow:   0 4px 14px rgba(109,94,240,.14);
+  --verdict-bad:          #E0483F;
+  --verdict-good:         #0FA88C;
+  --anchor-chip-bg:       #EEEDFB;
+  --anchor-chip-text:     #6D5EF0;
+
+  --bar-worsening:        #E0483F;
+  --bar-worsening-soft:   rgba(224, 72, 63, .55);
+  --bar-improving:        #0FA88C;
+  --bar-improving-soft:   rgba(15, 168, 140, .45);
+  --bar-track:            #F1F3F8;
+  --bar-zeroline:         rgba(15, 23, 42, .18);
+
+  --heat-0: rgba(224,72,63,.06);
+  --heat-1: rgba(224,72,63,.15);
+  --heat-2: rgba(224,72,63,.30);
+  --heat-3: rgba(224,72,63,.55);
+  --heat-4: rgba(224,72,63,.85);
+
+  --drawer-bg:            #FFFFFF;
+  --drawer-border:        rgba(15, 23, 42, .10);
+  --drawer-shadow:        -12px 0 32px rgba(15, 23, 42, .10);
+  --drawer-scrim:         rgba(15, 23, 42, .25);
+  --kpi-tile-bg:          #F7F8FB;
+  --callout-bg:           #FFFBEB;
+  --callout-border:       rgba(217, 138, 11, .40);
+  --handle-bg:            #6D5EF0;
+  --handle-text:          #FFFFFF;
+
+  --card-shadow: 0 1px 3px rgba(15, 23, 42, 0.05);
+}
+
+[data-theme="dark"] {
+  /* surfaces — Depth Intelligence */
+  --bg-page:        #07080F;
+  --bg-card:        #0D0F1C;
+  --bg-inset:       #13162A;
+  --bg-selected:    #1A1D3A;
+  --border:         rgba(255, 255, 255, 0.07);
+  --border-strong:  rgba(255, 255, 255, 0.13);
+
+  --text-primary:   #F4F6FF;
+  --text-secondary: #9CA3AF;
+  --text-muted:     #6B7280;
+
+  --accent:         #9B6DFF;
+  --accent-soft:    rgba(155, 109, 255, 0.16);
+  --teal:           #00E5CC;
+  --coral:          #FF5F6D;
+  --amber:          #FFB347;
+  --ice:            #A8C8FF;
+
+  --chart-observed:      #55607A;
+  --chart-observed-dot:  #8B94A8;
+  --chart-p50:           #9B6DFF;
+  --chart-band:          rgba(155, 109, 255, 0.18);
+  --chart-band-edge:     rgba(155, 109, 255, 0.42);
+  --chart-grid:          rgba(255, 255, 255, 0.05);
+  --chart-divider:       rgba(255, 255, 255, 0.30);
+  --chart-crosshair:     rgba(255, 255, 255, 0.35);
+  --pulse-core:          #9B6DFF;
+  --pulse-halo:          rgba(155, 109, 255, 0.40);
+
+  --card-shadow: none;
+
+  /* ── interpretation layer (forecast-drawer spec §2) ─────────────────── */
+  --interp-hero-border:   #9B6DFF;
+  --interp-hero-shadow:   0 4px 18px rgba(155,109,255,.22);
+  --verdict-bad:          #FF5F6D;
+  --verdict-good:         #00E5CC;
+  --anchor-chip-bg:       #1A1D3A;
+  --anchor-chip-text:     #A8C8FF;
+
+  --bar-worsening:        #FF5F6D;
+  --bar-worsening-soft:   rgba(255, 95, 109, .55);
+  --bar-improving:        #00E5CC;
+  --bar-improving-soft:   rgba(0, 229, 204, .45);
+  --bar-track:            #13162A;
+  --bar-zeroline:         rgba(255, 255, 255, .22);
+
+  --heat-0: rgba(255,95,109,.07);
+  --heat-1: rgba(255,95,109,.16);
+  --heat-2: rgba(255,95,109,.32);
+  --heat-3: rgba(255,95,109,.58);
+  --heat-4: rgba(255,95,109,.88);
+
+  --drawer-bg:            #0D0F1C;
+  --drawer-border:        rgba(255, 255, 255, .10);
+  --drawer-shadow:        -12px 0 40px rgba(0, 0, 0, .55);
+  --drawer-scrim:         rgba(7, 8, 15, .55);
+  --kpi-tile-bg:          #13162A;
+  --callout-bg:           rgba(255, 179, 71, .08);
+  --callout-border:       rgba(255, 179, 71, .35);
+  --handle-bg:            #9B6DFF;
+  --handle-text:          #FFFFFF;
+
+}
+
+/* Fonts — Syne display, DM Sans UI, DM Mono every numeric value. */
+.font-display { font-family: var(--font-syne), ui-sans-serif, system-ui, sans-serif; }
+.font-ui      { font-family: var(--font-dm-sans), ui-sans-serif, system-ui, sans-serif; }
+.font-data    { font-family: var(--font-dm-mono), ui-monospace, monospace; }
+
+/* Tabular figures: a ticking number must not shift its neighbours. */
+.tnum { font-feature-settings: "tnum" 1; font-variant-numeric: tabular-nums; }
+
+/* --------------------------------------------------------------------------
+   Live pulse dot (§3.3). Three concentric circles: an expanding ring, a soft
+   glow, and a core that overshoots past 1.0 and snaps back — the overshoot is
+   what reads as a blink rather than a throb.
+   -------------------------------------------------------------------------- */
+@keyframes pulseRing {
+  0%   { transform: scale(1);    opacity: 0.9; }
+  35%  { transform: scale(2.6);  opacity: 0;   }
+  100% { transform: scale(2.6);  opacity: 0;   }
+}
+@keyframes pulseCore {
+  0%, 100% { transform: scale(1); }
+  12%      { transform: scale(1.35); }
+  24%      { transform: scale(1); }
+}
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.25; }
+  12%      { opacity: 0.55; }
+}
+
+/* transform-box: fill-box is REQUIRED — without it SVG scales from the canvas
+   origin and the dot flies off across the chart. */
+.pulse-ring {
+  animation: pulseRing 2.4s cubic-bezier(.25,.6,.3,1) infinite;
+  transform-origin: center;
+  transform-box: fill-box;
+}
+.pulse-core {
+  animation: pulseCore 2.4s cubic-bezier(.34,1.56,.64,1) infinite;
+  transform-origin: center;
+  transform-box: fill-box;
+}
+.pulse-glow {
+  animation: pulseGlow 2.4s ease-in-out infinite;
+  transform-origin: center;
+  transform-box: fill-box;
+}
+.pulse-dot--forecast * { animation-delay: 1.2s; }
+
+/* Line draw-in (§6.1), as a left-to-right wipe rather than the stroke-dashoffset
+   trick the spec sketches.
+   The two cannot coexist: §3.2 gives the forecast line strokeDasharray "10 7",
+   and a dashoffset draw-in needs that same property, so one would erase the
+   other — the confident dashes would become a marching-ants animation. A
+   clip-path wipe reveals the line while leaving its dash pattern intact, and it
+   works under ResponsiveContainer where a normalised pathLength does not. */
+@keyframes drawIn {
+  from { clip-path: inset(0 100% 0 0); }
+  to   { clip-path: inset(0 0 0 0); }
+}
+.draw-observed { animation: drawIn 600ms ease-out both; }
+.draw-forecast { animation: drawIn 450ms ease-out 600ms both; }
+/* The fan lands only after both lines have arrived. */
+@keyframes fanIn { from { opacity: 0; } to { opacity: 1; } }
+.fan-in { animation: fanIn 300ms ease-out 1050ms both; }
+
+/* Driver bars (§4.2): staggered fill, delay set per row inline. */
+@keyframes barGrow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+.bar-grow {
+  transform-origin: left center;
+  animation: barGrow 500ms cubic-bezier(.22,.61,.36,1) both;
+}
+
+/* Signal switch (§4.3): crossfade, no layout shift. */
+@keyframes chartFade { from { opacity: 0; } to { opacity: 1; } }
+.chart-fade { animation: chartFade 250ms ease-out; }
+
+/* --------------------------------------------------------------------------
+   Forecast loader — three dots through wave → triangle → orbit.
+
+   One 4.8s timeline shared by all four tracks (three dots + the orbit wrapper),
+   so the phases stay locked together however the browser schedules them. Two
+   separate animations with their own durations would drift apart within a few
+   loops and the triangle would start forming mid-wave.
+
+   Geometry, in a 72px box whose centre is (36,36) and whose dots sit in a row
+   at x = 18 / 36 / 54. Every value below is a translate FROM that row seat:
+
+     triangle   apex (0,-18), base corners (±15,+9)
+     circle     r = 18, seats 120° apart at 180° / 300° / 60°
+
+   Dot 1's circle seat is 180°, which is exactly where it already sits — hence
+   its translate(0,0) through the orbit. That is not a missing keyframe.
+
+   The orbit itself is a rotation of the WRAPPER, not three hand-computed arcs:
+   the dots hold their circle seats and the group spins, which is both exact and
+   far cheaper than sampling a curve per dot.
+   -------------------------------------------------------------------------- */
+@keyframes loaderDot1 {
+  0%, 3%    { transform: translate(0, 0); }
+  8%        { transform: translate(0, -11px); }   /* wave, leads */
+  14%, 30%  { transform: translate(0, 0); }
+  45%, 52%  { transform: translate(3px, 9px); }   /* triangle, bottom-left */
+  60%, 90%  { transform: translate(0, 0); }       /* circle seat 180° */
+  100%      { transform: translate(0, 0); }
+}
+
+@keyframes loaderDot2 {
+  0%, 8%    { transform: translate(0, 0); }
+  14%       { transform: translate(0, -11px); }   /* wave, follows */
+  20%, 30%  { transform: translate(0, 0); }
+  45%, 52%  { transform: translate(0, -18px); }   /* triangle, apex */
+  60%, 90%  { transform: translate(9px, -15.6px); } /* circle seat 300° */
+  100%      { transform: translate(0, 0); }
+}
+
+@keyframes loaderDot3 {
+  0%, 14%   { transform: translate(0, 0); }
+  20%       { transform: translate(0, -11px); }   /* wave, trails */
+  26%, 30%  { transform: translate(0, 0); }
+  45%, 52%  { transform: translate(-3px, 9px); }  /* triangle, bottom-right */
+  60%, 90%  { transform: translate(-9px, 15.6px); } /* circle seat 60° */
+  100%      { transform: translate(0, 0); }
+}
+
+/* 360deg at 100% is visually identical to 0deg at 0%, so the loop is seamless
+   and the dots can walk back to the row underneath a wrapper that appears
+   stationary. */
+@keyframes loaderOrbit {
+  0%, 60%   { transform: rotate(0deg); }
+  90%, 100% { transform: rotate(360deg); }
+}
+
+.loader-orbit { animation: loaderOrbit 4.8s cubic-bezier(.45,.05,.55,.95) infinite; }
+.loader-dot-1 { animation: loaderDot1 4.8s cubic-bezier(.45,.05,.55,.95) infinite; }
+.loader-dot-2 { animation: loaderDot2 4.8s cubic-bezier(.45,.05,.55,.95) infinite; }
+.loader-dot-3 { animation: loaderDot3 4.8s cubic-bezier(.45,.05,.55,.95) infinite; }
+
+/* Reduced motion: the dots stay in their row and stay grey. The status line
+   still rotates, because that is information, not decoration. */
+@media (prefers-reduced-motion: reduce) {
+  .loader-orbit,
+  .loader-dot-1,
+  .loader-dot-2,
+  .loader-dot-3 { animation: none; }
+}
+
+/* --------------------------------------------------------------------------
+   §6.5 — non-negotiable. No pulse loop, no draw-in, no ticker. Hovers stay.
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .pulse-ring,
+  .pulse-core,
+  .pulse-glow { animation: none; }
+  .pulse-ring { opacity: 0.3; }
+  .pulse-glow { opacity: 0.3; }
+
+  .draw-observed,
+  .draw-forecast {
+    animation: none;
+    clip-path: none;
+  }
+  .fan-in,
+  .bar-grow,
+  .chart-fade { animation: none; }
+  .bar-grow { transform: none; }
+}
+
+/* ==========================================================================
+   BRAIN VISUALIZE MAP  (VISUALIZE_TAB_SPEC §3, §4, §7)
+
+   The one law: if it moves, a number moved it. Every duration and count below
+   is set from telemetry via a custom property — nothing here decides on its
+   own how fast anything should go.
+
+   All motion is transform / opacity / offset-distance only, so the whole scene
+   stays on the compositor and never triggers layout.
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   §3 — Particles. One document in flight, travelling its edge's real curve.
+   `offset-path` is set inline per particle from the same path the edge draws,
+   so a particle can never drift off its own edge.
+   -------------------------------------------------------------------------- */
+@keyframes vizFlow {
+  from { offset-distance: 0%; }
+  to   { offset-distance: 100%; }
+}
+
+.viz-particle {
+  offset-rotate: 0deg;
+  animation: vizFlow var(--viz-dur, 3s) linear infinite;
+  animation-delay: var(--viz-delay, 0s);
+  will-change: offset-distance;
+}
+
+/* --------------------------------------------------------------------------
+   §4.1 / §4.2 — The centre brain. Ring cadence IS the queue state: 3.4s idle,
+   2.0s while the ingest queue has depth. The 600ms swap means the change reads
+   as the system speeding up rather than as a jump cut.
+   -------------------------------------------------------------------------- */
+@keyframes vizBrainRing {
+  0%   { transform: scale(0.58); opacity: 0.5; }
+  70%  { opacity: 0.12; }
+  100% { transform: scale(1.65); opacity: 0; }
+}
+
+@keyframes vizCorePop {
+  0%, 100% { transform: scale(1); }
+  45%      { transform: scale(1.06); }
+}
+
+.viz-brain-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: vizBrainRing var(--viz-cycle, 3.4s) ease-out infinite;
+  animation-delay: var(--viz-delay, 0s);
+  transition: animation-duration 600ms ease;
+}
+
+.viz-brain-core {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.viz-brain-core--processing {
+  animation: vizCorePop var(--viz-cycle, 2s) ease-in-out infinite;
+}
+
+/* --------------------------------------------------------------------------
+   §4.3 — Node chips. One ring, 3s, staggered per node so the arc breathes
+   rather than strobing in unison.
+   -------------------------------------------------------------------------- */
+@keyframes vizNodeRing {
+  0%   { transform: scale(0.9); opacity: 0.45; }
+  100% { transform: scale(1.45); opacity: 0; }
+}
+
+.viz-node-ring {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: vizNodeRing 3s ease-out infinite;
+  animation-delay: var(--viz-delay, 0s);
+}
+
+.viz-node-chip {
+  transition: transform 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.viz-node:hover .viz-node-chip,
+.viz-node:focus-visible .viz-node-chip {
+  transform: translateY(-2px);
+}
+
+.viz-edge {
+  transition: stroke-opacity 200ms ease, stroke-width 120ms ease;
+}
+
+.viz-node:hover ~ svg .viz-edge[data-edge],
+.viz-edge[data-hovered="true"] {
+  stroke-width: 2;
+}
+
+/* --------------------------------------------------------------------------
+   §7.5 — Ambient drift. The only unbound motion permitted on this screen, and
+   the first thing to cut if the frame budget slips.
+   -------------------------------------------------------------------------- */
+@keyframes vizDrift {
+  0%   { transform: translate(0, 0); }
+  50%  { transform: translate(var(--viz-dx, 8px), var(--viz-dy, -10px)); }
+  100% { transform: translate(0, 0); }
+}
+
+.viz-ambient {
+  animation: vizDrift var(--viz-dur, 18s) ease-in-out infinite;
+  animation-delay: var(--viz-delay, 0s);
+  opacity: 0.4;
+}
+
+/* --------------------------------------------------------------------------
+   §7.2 — Off-screen or hidden: everything stops. Not "slows down".
+   -------------------------------------------------------------------------- */
+.viz-paused .viz-particle,
+.viz-paused .viz-brain-ring,
+.viz-paused .viz-brain-core--processing,
+.viz-paused .viz-node-ring,
+.viz-paused .viz-ambient {
+  animation-play-state: paused;
+}
+
+/* --------------------------------------------------------------------------
+   §7.4 — Reduced motion. The map goes still but stays readable: edge opacity
+   still encodes activity, so "what is running right now" survives with no
+   movement at all.
+   -------------------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .viz-particle,
+  .viz-ambient { display: none; }
+
+  .viz-brain-ring {
+    animation: none;
+    opacity: 0.22;
+    transform: scale(1.2);
+  }
+
+  .viz-brain-core--processing { animation: none; }
+
+  .viz-node-ring {
+    animation: none;
+    opacity: 0.28;
+    transform: scale(1.15);
+  }
+}

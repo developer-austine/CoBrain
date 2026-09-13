@@ -1,0 +1,1095 @@
+================================================================================
+COMPANY BRAIN — FRONTEND ARCHITECTURE
+================================================================================
+Document type    : Technical architecture & onboarding reference
+Audience         : Frontend engineers + AI coding agents continuing the build
+Scope            : FRONTEND ONLY (Next.js 16 + React 19 app architecture)
+Excluded         : Backend pipeline details (documented in architecture.txt)
+Last updated     : Maintained alongside the codebase — update when structure changes
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+If you are a new engineer or an AI agent picking up this frontend project, read
+sections in this order:
+
+  1. Section 1  — What the Frontend Does (the mental model)
+  2. Section 2  — The Three Layers (App Router, Components, State)
+  3. Section 3  — The Data Flow (user action → API → DB)
+  4. Section 4  — The Folder Tree (where everything lives)
+  5. Section 5  — Page-by-Page Breakdown (what each route does)
+  6. Section 6  — Component Hierarchy (relationships between components)
+  7. Section 7  — API Contracts (shapes that connect frontend ↔ backend)
+  8. Section 8  — Conventions and Rules (how to write code that fits)
+
+Do NOT start writing code until you understand Section 3. Every component in
+this frontend exists to move a user through the workflow defined there.
+
+
+--------------------------------------------------------------------------------
+1. WHAT THE FRONTEND DOES
+--------------------------------------------------------------------------------
+The Company Brain frontend is the user-facing layer of a Retrieval-Augmented
+Intelligence (RAI) platform. It allows users to:
+
+  1. Build Workflows
+     - Visual workflow editor with drag-drop node system
+     - Define data pipelines: connectors → normalisation → storage
+     - Save workflows as DAG (directed acyclic graph)
+
+  2. Connect Data Sources
+     - OAuth authentication (Gmail, GitHub, Notion)
+     - Custom API webhook ingestion
+     - Manage multiple connections per workflow
+
+  3. Sync & Monitor Data
+     - One-click sync to pull latest data from sources
+     - Real-time progress monitoring (PENDING → QUEUED → PROCESSED)
+     - Error tracking and debugging
+
+  4. Search Company Knowledge
+     - Semantic search across all ingested documents
+     - Citation of sources and authors
+     - RAG-powered Q&A (future)
+
+The frontend is the bridge between users (who want to ask questions) and the
+backend intelligence layer (which answers them).
+
+KEY MENTAL MODEL:
+  Workflows = user-defined pipelines (stored as JSON definition)
+  Execution = a single run of a workflow (status tracked in DB)
+  Sync = pulling data from connectors and staging in Postgres
+  Processing = Python worker pipeline (normalise → chunk → embed)
+  Search = querying Qdrant vectors with natural language
+
+
+--------------------------------------------------------------------------------
+2. THE THREE LAYERS
+--------------------------------------------------------------------------------
+The frontend uses Next.js 16 with App Router. The architecture has three layers:
+
+  LAYER 1: PAGES & ROUTING (app/ folder)
+    Role     : URL-to-content mapping. Server/client split.
+    Why      : App Router separates concerns (data fetching vs rendering)
+    Pattern  : Each route is a folder with page.tsx
+    Example  : /app/connectors/[workflowId]/page.tsx
+               → /connectors/{id} route (workflow editor page)
+
+  LAYER 2: COMPONENTS (app/**/_components/)
+    Role     : Reusable UI building blocks. Interactive elements.
+    Why      : React components handle state, events, rendering
+    Pattern  : Folder per feature, export from index.ts
+    Example  : FlowEditor.tsx (drag-drop workflow canvas)
+               NodeCard.tsx (visual node in flow)
+
+  LAYER 3: STATE & LOGIC (lib/ folder)
+    Role     : Data fetching, server actions, utilities, types
+    Why      : Keep logic separate from presentation
+    Pattern  : Pure functions, server actions, type definitions
+    Example  : lib/workflow/executionPlan.ts (convert flow to execution steps)
+               actions/workflows/runWorkflow.ts (server action to trigger run)
+
+
+LAYER INTERACTION:
+  User clicks "Run Workflow" in Page
+    ↓ (calls server action)
+  Server Action fetches data, queues documents
+    ↓ (updates DB)
+  Page re-renders with new status
+    ↓ (uses component to display)
+  Component queries status API (polling)
+    ↓ (every 2 seconds)
+  Component re-renders with updated status
+    ↓ (user sees progress)
+
+
+--------------------------------------------------------------------------------
+3. THE END-TO-END DATA FLOW (READ THIS CAREFULLY)
+--------------------------------------------------------------------------------
+This is the spine of the entire frontend. Every component exists to serve one
+of these flows.
+
+FLOW A: WORKFLOW CREATION & EDITING
+  ──────────────────────────────────
+  Page: /connectors/editor → creates new workflow
+    1. User names workflow: "Sales Data Pipeline"
+    2. Server Action: createWorkflow(name, description)
+       └─ Inserts Workflow record in Postgres
+       └─ Returns workflow ID
+    3. Redirect to /connectors/{workflowId}
+    4. Page loads: EditorLayout.tsx
+       └─ Renders: FlowEditor component (React Flow canvas)
+
+FLOW B: NODE SELECTION & CONNECTION
+  ──────────────────────────────────
+  Page: /connectors/{workflowId}
+    1. User sees task menu on left (TaskMenu.tsx)
+       ├─ Gmail
+       ├─ GitHub
+       ├─ Notion
+       └─ Custom API
+    2. User drags "Gmail" onto canvas
+       └─ FlowEditor creates node
+       └─ Assigns unique nodeId
+       └─ Stores in React Flow state (NOT persisted yet)
+    3. User connects nodes with edges
+       └─ Defines data dependencies
+       └─ FlowEditor tracks edges in state
+    4. User clicks "Save"
+       └─ Server Action: saveWorkflow(workflowId, flowDef)
+       └─ Converts React Flow nodes/edges → JSON definition
+       └─ Stores in Workflow.definition (Postgres)
+
+FLOW C: CONNECTOR AUTHENTICATION
+  ──────────────────────────────
+  User right-clicks Gmail node → "Connect Gmail"
+    1. Component renders connect button (GmailConnectButton.tsx)
+    2. User clicks button
+       └─ Redirect to /api/gmail/auth
+       └─ OAuth flow with Google
+       └─ Google redirects to /api/gmail/callback
+    3. Callback handler:
+       └─ Exchanges code for access token
+       └─ Inserts GmailConnection record (workflowId + nodeId)
+       └─ Stores accessToken (encrypted ideally)
+       └─ Redirects back to /connectors/{workflowId}
+    4. Flow editor updates (shows "Connected" status on node)
+
+FLOW D: DATA SYNC & INGESTION
+  ──────────────────────────
+  User clicks "Sync" on Gmail node
+    1. Node component calls sync handler
+       └─ POST /api/gmail/sync { workflowId, nodeId }
+    2. Sync route handler:
+       └─ Fetches GmailConnection (via workflowId + nodeId)
+       └─ Calls Gmail API (paginated)
+       └─ UPSERT Email records in Postgres (status=PENDING)
+       └─ LPUSH each Email to Redis queue (QueuePayload JSON)
+       └─ Update Email.status = QUEUED
+       └─ Return { synced: X, queued: X, skipped: Y }
+    3. Frontend shows response toast: "Synced X emails"
+
+FLOW E: WORKFLOW EXECUTION & MONITORING
+  ──────────────────────────────────────
+  User clicks "Run Workflow" button
+    1. Server Action: runWorkflow(workflowId)
+       └─ Validates workflow (has entry point, no cycles)
+       └─ Creates WorkflowExecution record
+       └─ Queries all connections in workflow
+       └─ For each connection, finds PENDING documents
+       └─ LPUSH each document to Redis queue
+       └─ Update document.status = QUEUED
+       └─ Return { executionId, totalQueued }
+    2. Frontend redirects to execution view
+       └─ /connectors/runs/{workflowId}/{executionId}
+    3. Page renders ExecutionView with PipelineMonitor
+       └─ Component polls GET /api/document/{docId}/status
+       └─ Every 2 seconds: queries Postgres for status
+       └─ Shows progress: PENDING → QUEUED → PROCESSING → PROCESSED
+       └─ User sees real-time status bar with error messages
+
+FLOW F: DOCUMENT PROCESSING (BACKEND)
+  ──────────────────────────────────
+  (Frontend is passive here; backend worker is active)
+    1. Python Celery worker BRPOP from Redis queue
+    2. Processes document (9 steps: map → norm → PII → dedup → chunk → embed)
+    3. UPSERT vectors to Qdrant
+    4. UPDATE Postgres: Email.status = PROCESSED (with timestamp)
+    5. Frontend's polling detects status change
+       └─ Shows green checkmark: ✓ Processed
+
+FLOW G: SEMANTIC SEARCH & RESULTS
+  ───────────────────────────────
+  User navigates to /activity/chat (search page)
+    1. User enters query: "What are our Q2 revenue projections?"
+    2. Frontend calls POST /api/search { query, limit }
+    3. Next.js route calls Python backend:
+       └─ POST http://localhost:8000/api/search
+       └─ Python embeds query, searches Qdrant, returns results
+    4. Frontend displays SearchResults component
+       ├─ Text snippet (first 200 chars)
+       ├─ Source (GMAIL, GITHUB, NOTION, CUSTOM)
+       ├─ Author (sender/creator)
+       ├─ Relevance score (0-100%)
+       └─ Chunk position (e.g., "Chunk 2 of 5")
+
+FLOW H: EXECUTION HISTORY & DEBUGGING
+  ───────────────────────────────────
+  User navigates to /connectors/runs/{workflowId}
+    1. Page lists all ExecutionPhase records for this workflow
+    2. For each phase:
+       └─ Shows: phase number, status, nodes run, timestamps
+    3. User can drill into failed phase
+       └─ Shows: which documents failed, error messages
+       └─ Can trigger retry (future feature)
+
+
+END STATE:
+  The frontend has guided the user from:
+    1. Defining a workflow (DAG of connectors)
+    2. Authenticating data sources (OAuth)
+    3. Syncing documents (pulling raw data)
+    4. Monitoring processing (real-time status)
+    5. Searching results (semantic Q&A)
+
+  The user now has a searchable knowledge base of their company's data,
+  powered by AI-driven intelligence.
+
+
+--------------------------------------------------------------------------------
+4. FRONTEND FOLDER TREE
+--------------------------------------------------------------------------------
+This is the canonical structure. Keep it exactly like this.
+
+frontend/
+│
+├── app/                               # Next.js App Router root
+│   │
+│   ├── (auth)/                        # Auth layout group (Clerk sign-in/up)
+│   │   ├── layout.tsx
+│   │   ├── sign-in/[[...sign-in]]/page.tsx
+│   │   └── sign-up/[[...sign-up]]/page.tsx
+│   │
+│   ├── (dashboard)/                   # Protected dashboard routes
+│   │   ├── layout.tsx                 # Dashboard wrapper + nav
+│   │   ├── (home)/page.tsx            # Home/dashboard index
+│   │   │
+│   │   ├── _components/               # Shared dashboard components
+│   │   │   ├── CreateWorkflowDialog.tsx
+│   │   │   ├── WorkflowCard.tsx
+│   │   │   ├── PipelineMonitor.tsx    # [NEW] Status monitor
+│   │   │   └── SearchResults.tsx      # [NEW] Search results
+│   │   │
+│   │   ├── (home)/page.tsx            # Landing page (with workflow list)
+│   │   │
+│   │   └── activity/                  # Activity/search routes
+│   │       ├── chat/page.tsx          # Chat/search interface
+│   │       └── chatlogs/page.tsx      # Chat history
+│   │
+│   ├── connectors/                    # Workflow editor routes
+│   │   ├── layout.tsx                 # Connectors layout (with sidebar)
+│   │   ├── page.tsx                   # List workflows
+│   │   ├── editor/page.tsx            # Create new workflow
+│   │   │
+│   │   ├── [workflowId]/              # Edit workflow
+│   │   │   ├── page.tsx               # Main editor page
+│   │   │   │
+│   │   │   └── _components/           # Workflow editor components
+│   │   │       ├── Editor.tsx         # Main editor layout
+│   │   │       ├── FlowEditor.tsx     # React Flow canvas (@xyflow/react)
+│   │   │       ├── TaskMenu.tsx       # Left sidebar task palette
+│   │   │       ├── WorkflowContext.tsx# Context for flow state
+│   │   │       │
+│   │   │       ├── nodes/             # Node components
+│   │   │       │   ├── NodeComponent.tsx      # Main node wrapper
+│   │   │       │   ├── NodeHeader.tsx        # Title + icon
+│   │   │       │   ├── NodeInputs.tsx        # Input param fields
+│   │   │       │   ├── NodeOutputs.tsx       # Output display
+│   │   │       │   ├── NodeParamField.tsx    # Generic param input
+│   │   │       │   ├── ConnectorIconPicker.tsx
+│   │   │       │   └── common.tsx            # Shared node styles
+│   │   │       │
+│   │   │       ├── param/             # Parameter input components
+│   │   │       │   ├── StringParam.tsx       # Text input
+│   │   │       │   ├── BrowserInstanceParam.tsx
+│   │   │       │   ├── GmailConnectButton.tsx
+│   │   │       │   ├── GithubConnectorButton.tsx
+│   │   │       │   ├── NotionConnectButton.tsx
+│   │   │       │   └── CustomConnectButton.tsx
+│   │   │       │
+│   │   │       ├── edges/             # Edge (connection) components
+│   │   │       │   └── DeletableEdge.tsx    # Custom edge with delete
+│   │   │       │
+│   │   │       ├── topbar/            # Top toolbar
+│   │   │       │   ├── Topbar.tsx
+│   │   │       │   └── SaveBtn.tsx
+│   │   │       │
+│   │   │       └── WorkflowContext.tsx# React Context for flow state
+│   │   │
+│   │   └── runs/                      # Execution history/debugging
+│   │       └── [workflowId]/
+│   │           └── [executionId]/page.tsx  # Execution detail view
+│   │
+│   ├── api/                           # Next.js API routes
+│   │   ├── gmail/                     # Gmail connector
+│   │   │   ├── auth/route.ts          # OAuth initiate
+│   │   │   ├── callback/route.ts      # OAuth callback
+│   │   │   ├── sync/route.ts          # Pull & queue emails [MODIFIED]
+│   │   │   └── status/route.ts        # Sync status
+│   │   │
+│   │   ├── github/                    # GitHub connector
+│   │   │   ├── auth/route.ts
+│   │   │   ├── callback/route.ts
+│   │   │   ├── sync/route.ts
+│   │   │   └── status/route.ts
+│   │   │
+│   │   ├── notion/                    # Notion connector
+│   │   │   ├── auth/route.ts
+│   │   │   ├── callback/route.ts
+│   │   │   ├── sync/route.ts
+│   │   │   └── status/route.ts
+│   │   │
+│   │   ├── custom_api/                # Custom connector
+│   │   │   ├── auth/route.ts
+│   │   │   ├── ingest/route.ts        # Webhook endpoint
+│   │   │   ├── sync/route.ts
+│   │   │   └── status/route.ts
+│   │   │
+│   │   ├── workflow/                  # Workflow management [NEW ENDPOINT]
+│   │   │   └── [workflowId]/
+│   │   │       └── run/route.ts       # Trigger workflow execution
+│   │   │
+│   │   ├── document/                  # Document tracking [NEW ENDPOINT]
+│   │   │   └── [docId]/
+│   │   │       └── status/route.ts    # Get document status
+│   │   │
+│   │   ├── search/                    # Search API [NEW ENDPOINT]
+│   │   │   └── route.ts               # Semantic search gateway
+│   │   │
+│   │   └── queue/                     # Queue management (debugging)
+│   │       └── flush/route.ts         # Clear queue (dev only)
+│   │
+│   ├── layout.tsx                     # Root layout
+│   │                                  # - ClerkProvider
+│   │                                  # - AppProviders
+│   │                                  # - Global nav
+│   │
+│   └── not-found.tsx                  # 404 page
+│
+├── lib/                               # Utilities & server logic
+│   │
+│   ├── prisma.ts                      # Singleton Prisma client
+│   │
+│   ├── generated/                     # Generated by build
+│   │   └── prisma/                    # Prisma client (generated)
+│   │
+│   ├── workflow/                      # Workflow logic
+│   │   └── executionPlan.ts           # Flow → execution plan conversion
+│   │
+│   ├── connector/                     # Connector utilities
+│   │   ├── task/
+│   │   │   └── registry.ts            # Task type registry & metadata
+│   │   └── createFlowNode.ts          # Factory for creating nodes
+│   │
+│   ├── queue/                         # Queue utilities
+│   │   └── publisher.ts               # Redis queue publisher
+│   │
+│   └── utils.ts                       # Shared utilities
+│
+├── types/                             # TypeScript type definitions
+│   │
+│   ├── appNode.ts                     # Extended Flow Node type
+│   ├── task.ts                        # Task, TaskParam, TaskRegistry
+│   ├── workflow.ts                    # Workflow, ExecutionPlan, Phase
+│   └── index.ts                       # Central export
+│
+├── actions/                           # Server Actions (Next.js 16)
+│   │
+│   └── workflows/                     # Workflow server actions
+│       ├── createWorkflow.ts          # Create new workflow
+│       ├── saveWorkflow.ts            # Save workflow definition
+│       ├── runWorkflow.ts             # Trigger workflow execution
+│       ├── deleteWorkflow.ts          # Delete workflow
+│       └── getWorkflows.ts            # Fetch user's workflows
+│
+├── components/                        # Reusable UI components
+│   │
+│   ├── providers/                     # React Providers
+│   │   ├── AppProviders.tsx           # TanStack Query, Theme, etc.
+│   │   └── index.ts
+│   │
+│   ├── ui/                            # shadcn/ui components
+│   │   ├── button.tsx
+│   │   ├── card.tsx
+│   │   ├── input.tsx
+│   │   ├── dialog.tsx
+│   │   └── ... (other UI primitives)
+│   │
+│   └── index.ts                       # Central export
+│
+├── prisma/                            # Database schema
+│   ├── schema.prisma                  # Prisma schema definition
+│   └── migrations/                    # Database migrations
+│
+├── .env.example                       # Environment variables template
+├── .env.local                         # Local environment (git-ignored)
+├── eslintrc.json                      # ESLint config
+├── next.config.ts                     # Next.js config
+├── tailwind.config.ts                 # Tailwind CSS config
+├── tsconfig.json                      # TypeScript config
+├── package.json                       # Dependencies
+└── pnpm-lock.yaml                     # Dependency lock file
+
+
+KEY CONVENTIONS:
+  ├─ _components/ = private to a route (not exported from index)
+  ├─ components/ = shared across multiple routes (exported)
+  ├─ actions/ = server actions (must use "use server")
+  ├─ lib/ = utilities, types, helpers
+  ├─ api/ = API routes (not server actions)
+  ├─ types/ = central TypeScript definitions
+  └─ [workflowId] = dynamic segment (Next.js routing)
+
+
+--------------------------------------------------------------------------------
+5. PAGE-BY-PAGE BREAKDOWN
+--------------------------------------------------------------------------------
+
+=== app/(auth)/sign-in/[[...sign-in]]/page.tsx ===
+Clerk-provided page. Customizable via Clerk Dashboard.
+Role: Authenticate user before accessing dashboard
+Flow: User logs in → JWT set → Redirects to /
+
+=== app/(auth)/sign-up/[[...sign-up]]/page.tsx ===
+Clerk-provided page.
+Role: New user registration
+Flow: User signs up → Email verification → Redirects to /
+
+=== app/(dashboard)/layout.tsx ===
+Root layout for all protected routes.
+Contains: ClerkProvider, AppProviders, top nav, sidebar
+Children: All /connectors/*, /activity/*, (home)/page routes
+Auth check: Redirects to sign-in if not authenticated
+
+=== app/(dashboard)/(home)/page.tsx ===
+Home/dashboard landing page.
+Shows:
+  - Welcome message
+  - [NEW] PipelineMonitor (for recently synced documents)
+  - [NEW] SearchResults (search interface)
+  - WorkflowCard[] (user's workflows)
+  - CreateWorkflowDialog
+Features:
+  - List all workflows for this user
+  - Create new workflow button
+  - Quick links to sync/search
+
+=== app/connectors/page.tsx ===
+Workflow list page. Lists all workflows.
+Shows: WorkflowCard[] with edit/delete buttons
+Actions: CreateWorkflow, DeleteWorkflow
+
+=== app/connectors/editor/page.tsx ===
+Create new workflow page.
+Shows: Form to enter workflow name and description
+Actions: createWorkflow (server action)
+Redirect: To /connectors/{workflowId} after creation
+
+=== app/connectors/[workflowId]/page.tsx ===
+Main workflow editor page. THE CORE PAGE.
+Components:
+  ├─ Editor.tsx (main wrapper)
+  ├─ FlowEditor.tsx (React Flow canvas)
+  ├─ TaskMenu.tsx (left sidebar palette)
+  ├─ NodeComponent[] (rendered by React Flow)
+  └─ Topbar.tsx (save/run buttons)
+Features:
+  - Drag-drop node creation
+  - Edge (connection) creation
+  - Node parameter configuration
+  - OAuth authentication UI for connectors
+  - Save workflow definition
+  - Run workflow button
+  - Sync button per node
+
+=== app/connectors/runs/[workflowId]/[executionId]/page.tsx ===
+Execution detail/debugging page.
+Shows:
+  - ExecutionPhase[] with status and timestamps
+  - PipelineMonitor (tracks document status for this execution)
+  - Document list (Email, GitHubItem, NotionPage, CustomDocument)
+  - Error messages for failed items
+Features:
+  - Drill into failed phase
+  - Retry failed documents (future)
+  - Download results (future)
+
+=== app/activity/chat/page.tsx ===
+Chat/search interface page.
+Shows:
+  - [NEW] SearchResults component
+  - Chat history (future)
+  - Question input field
+Features:
+  - Semantic search
+  - Display results with citations
+  - RAG-powered responses (future)
+
+=== app/activity/chatlogs/page.tsx ===
+Chat history page.
+Shows: Previous searches/conversations
+Features: Search history, delete old chats
+
+
+--------------------------------------------------------------------------------
+6. COMPONENT HIERARCHY & RELATIONSHIPS
+================================================================================
+
+ROOT: app/layout.tsx
+  ├─ ClerkProvider (authentication)
+  ├─ AppProviders (QueryProvider, Theme, etc.)
+  │
+  ├─ (auth)/layout.tsx
+  │   ├─ sign-in/[[...sign-in]]/page.tsx [Clerk UI]
+  │   └─ sign-up/[[...sign-up]]/page.tsx [Clerk UI]
+  │
+  └─ (dashboard)/layout.tsx [Protected by middleware]
+      │
+      ├─ Navigation/Sidebar
+      │   └─ Links: Home, Workflows, Search, Settings
+      │
+      ├─ (home)/page.tsx
+      │   ├─ WorkflowCard[] [reusable]
+      │   │   └─ Shows workflow name, description, edit/delete buttons
+      │   ├─ CreateWorkflowDialog [reusable]
+      │   │   └─ Form to create new workflow
+      │   ├─ [NEW] PipelineMonitor [reusable]
+      │   │   └─ Polls status API, shows progress
+      │   └─ [NEW] SearchResults [reusable]
+      │       └─ Query input, results display
+      │
+      ├─ connectors/layout.tsx
+      │   └─ Sidebar with workflow list
+      │
+      ├─ connectors/page.tsx
+      │   └─ WorkflowCard[]
+      │
+      ├─ connectors/editor/page.tsx
+      │   └─ CreateWorkflowDialog
+      │
+      ├─ connectors/[workflowId]/page.tsx [THE CORE EDITOR]
+      │   └─ Editor.tsx
+      │       ├─ FlowEditor.tsx [React Flow Container]
+      │       │   ├─ TaskMenu.tsx [Left sidebar palette]
+      │       │   │   └─ TaskItem[] (draggable)
+      │       │   │
+      │       │   └─ Canvas [React Flow]
+      │       │       ├─ NodeComponent[workflowId] [React Flow Node]
+      │       │       │   ├─ NodeHeader.tsx
+      │       │       │   │   └─ Connector icon + name
+      │       │       │   ├─ NodeInputs.tsx
+      │       │       │   │   └─ NodeParamField[]
+      │       │       │   │       ├─ StringParam.tsx
+      │       │       │   │       ├─ GmailConnectButton.tsx
+      │       │       │   │       ├─ GithubConnectorButton.tsx
+      │       │       │   │       ├─ NotionConnectButton.tsx
+      │       │       │   │       └─ CustomConnectButton.tsx
+      │       │       │   │
+      │       │       │   └─ NodeOutputs.tsx
+      │       │       │       └─ Shows output fields
+      │       │       │
+      │       │       ├─ DeletableEdge[] [React Flow Edge]
+      │       │       │   └─ Clickable to delete
+      │       │       │
+      │       │       └─ Handle[] [React Flow Handle - internal]
+      │       │           └─ Connection points
+      │       │
+      │       └─ Topbar.tsx
+      │           ├─ SaveBtn (calls saveWorkflow server action)
+      │           ├─ RunBtn (calls runWorkflow server action)
+      │           └─ NodeSyncBtn (calls sync API route)
+      │
+      ├─ connectors/runs/[workflowId]/[executionId]/page.tsx
+      │   └─ ExecutionView
+      │       ├─ [NEW] PipelineMonitor (shows execution status)
+      │       ├─ ExecutionPhase[] (list of phases)
+      │       └─ DocumentList (Email, GitHub, Notion, Custom)
+      │
+      ├─ activity/chat/page.tsx
+      │   ├─ ChatHistory (future)
+      │   └─ [NEW] SearchResults
+      │       ├─ Query input
+      │       └─ ResultCard[]
+      │           ├─ Text snippet
+      │           ├─ Source badge
+      │           ├─ Author
+      │           └─ Relevance score
+      │
+      └─ activity/chatlogs/page.tsx
+          └─ ChatLog[]
+
+
+COMPONENT IMPORT TREE:
+  Editor.tsx
+    ├─ imports FlowEditor.tsx
+    │   ├─ imports TaskMenu.tsx
+    │   │   └─ imports TaskItem (from registry)
+    │   ├─ imports NodeComponent.tsx
+    │   │   ├─ imports NodeHeader.tsx
+    │   │   ├─ imports NodeInputs.tsx
+    │   │   │   └─ imports NodeParamField.tsx
+    │   │   │       ├─ imports StringParam.tsx
+    │   │   │       ├─ imports GmailConnectButton.tsx
+    │   │   │       └─ imports GithubConnectorButton.tsx
+    │   │   └─ imports NodeOutputs.tsx
+    │   └─ imports DeletableEdge.tsx
+    │
+    └─ imports Topbar.tsx
+        └─ imports SaveBtn.tsx
+
+
+STATE MANAGEMENT:
+  React Flow State = node/edge positions, connections (local UI state)
+  WorkflowContext = selected node, tool state (local to editor)
+  Prisma/Postgres = Workflow definition, Connections, Documents
+  React Query = API response caching (status polling)
+  Clerk = User authentication
+
+
+PASSING DATA DOWN:
+  app/(dashboard)/(home)/page.tsx
+    └─ <WorkflowCard workflow={workflow} />
+         └─ <CreateWorkflowDialog defaultName="New Workflow" />
+
+  app/connectors/[workflowId]/page.tsx
+    └─ <Editor workflowId={workflowId} />
+         └─ <FlowEditor workflowId={workflowId} />
+              └─ <NodeComponent nodeId={nodeId} workflowId={workflowId} />
+                   └─ <GmailConnectButton nodeId={nodeId} workflowId={workflowId} />
+
+
+--------------------------------------------------------------------------------
+7. API CONTRACTS (DATA SHAPES)
+================================================================================
+These are the exact shapes passed between frontend ↔ backend. Treat them as
+frozen interfaces.
+
+=== WORKFLOW (Database Model) ===
+{
+  id: string (uuid)
+  userId: string (Clerk user ID)
+  name: string
+  description?: string
+  definition: string (JSON stringified nodes/edges)
+  status: string ("draft" | "active" | "paused")
+  createdAt: DateTime
+  updatedAt: DateTime
+}
+
+Definition JSON shape:
+{
+  nodes: [
+    {
+      id: string
+      type: string ("task" type, e.g., "gmail", "github", "notion", "custom")
+      position: { x: number, y: number }
+      data: {
+        label: string
+        taskType: string
+        inputs: {
+          [paramName]: any (user-configured values)
+        }
+      }
+    }
+  ],
+  edges: [
+    {
+      id: string
+      source: string (source node ID)
+      target: string (target node ID)
+      data?: { connection: string }
+    }
+  ]
+}
+
+=== WORKFLOW EXECUTION (Database Model) ===
+{
+  id: string (cuid)
+  workflowId: string
+  userId: string
+  trigger: string ("manual" | "scheduled" | "webhook")
+  status: string ("PENDING" | "RUNNING" | "COMPLETED" | "FAILED")
+  createdAt: DateTime
+  startedAt?: DateTime
+  completedAt?: DateTime
+}
+
+=== EXECUTION PHASE (Database Model) ===
+{
+  id: string (cuid)
+  executionId: string
+  userId: string
+  status: string ("PENDING" | "RUNNING" | "COMPLETED" | "FAILED")
+  number: int (phase sequence)
+  node: string (node ID)
+  name: string (node label)
+  startedAt?: DateTime
+  completedAt?: DateTime
+  inputs?: string (JSON)
+  outputs?: string (JSON)
+  creditCost?: int
+}
+
+=== REQUEST: POST /api/workflows (Create) ===
+{
+  name: string (required)
+  description?: string
+}
+
+=== RESPONSE: 200 ===
+{
+  id: string (workflow ID)
+  name: string
+  status: string
+}
+
+=== REQUEST: PUT /api/workflows/{id} (Save) ===
+{
+  definition: {
+    nodes: [],
+    edges: []
+  }
+}
+
+=== RESPONSE: 200 ===
+{
+  id: string
+  definition: string (stored)
+}
+
+=== REQUEST: POST /api/workflow/{workflowId}/run (Execute) ===
+{} (empty body; uses workflowId from URL)
+
+=== RESPONSE: 200 ===
+{
+  executionId: string
+  totalQueued: int
+  breakdown: {
+    emails: int
+    github: int
+    notion: int
+    custom: int
+  }
+}
+
+=== REQUEST: GET /api/document/{docId}/status ===
+(no body; uses docId from URL)
+
+=== RESPONSE: 200 ===
+{
+  id: string
+  source: "gmail" | "github" | "notion" | "custom"
+  status: "PENDING" | "QUEUED" | "PROCESSING" | "PROCESSED" | "FAILED"
+  errorMessage?: string
+  queuedAt?: string (ISO datetime)
+  processedAt?: string (ISO datetime)
+  author?: string
+  subject?: string
+}
+
+=== REQUEST: POST /api/gmail/sync ===
+{
+  workflowId: string
+  nodeId: string
+}
+
+=== RESPONSE: 200 ===
+{
+  success: boolean
+  synced: int (documents synced to Postgres)
+  queued: int (documents queued to Redis) [NEW]
+  skipped: int
+  connectedAs: string (email address)
+  message: string
+}
+
+=== REQUEST: POST /api/search ===
+{
+  query: string (natural language question)
+  limit?: int (default 5)
+}
+
+=== RESPONSE: 200 ===
+{
+  results: [
+    {
+      text: string (chunk content)
+      source: "gmail" | "github" | "notion" | "custom"
+      author: string
+      timestamp: string (ISO datetime)
+      chunk_index: int
+      total_chunks: int
+      parent_doc_id: string
+      score: float (0-1, cosine similarity)
+    }
+  ]
+}
+
+=== CONNECTOR CONNECTION (Database Model) ===
+All connectors follow similar pattern:
+
+GmailConnection:
+{
+  id: string
+  workflowId: string
+  nodeId: string
+  userId: string
+  accessToken: string
+  refreshToken?: string
+  tokenExpiry?: DateTime
+  email?: string
+}
+
+GitHubConnection:
+{
+  id: string
+  workflowId: string
+  nodeId: string
+  userId: string
+  accessToken: string
+  repository: string (owner/repo)
+}
+
+NotionConnection:
+{
+  id: string
+  workflowId: string
+  nodeId: string
+  userId: string
+  accessToken: string
+  workspaceName?: string
+  workspaceId?: string
+  botId?: string
+}
+
+CustomConnection:
+{
+  id: string
+  workflowId: string
+  nodeId: string
+  userId: string
+  clientId: string
+  clientSecret: string
+  webhookUrl?: string
+  webhookSecret?: string
+  status: string
+}
+
+KEY PRINCIPLE:
+  Each connector is tied to: workflow + node (allows multiple auth per workflow)
+
+
+--------------------------------------------------------------------------------
+8. CONVENTIONS & RULES
+================================================================================
+
+NAMING CONVENTIONS
+  ├─ Files: PascalCase for components, kebab-case for routes
+  │  Example: FlowEditor.tsx, task-registry.ts
+  ├─ Variables: camelCase for JS, kebab-case for CSS classes
+  │  Example: workflowId, node-header
+  ├─ Routes: kebab-case path segments, PascalCase in brackets
+  │  Example: /connectors/[workflowId]/page.tsx
+  └─ Functions: camelCase for functions, UPPER_CASE for constants
+     Example: fetchWorkflow(), DEFAULT_CHUNK_SIZE
+
+SERVER/CLIENT SPLIT
+  ├─ Server Components (default): Database queries, secrets, auth checks
+  │  Pattern: async function, no hooks, no "use client"
+  │  Location: page.tsx, layout.tsx, async components
+  │
+  └─ Client Components: Interactive UI, state, event handlers
+     Pattern: "use client" directive at top
+     Location: _components/, param input fields, buttons
+
+SERVER ACTIONS vs API ROUTES
+  ├─ Use Server Actions for: Mutations (create/update/delete workflows)
+  │  Location: actions/ folder
+  │  Pattern: "use server", called directly from Client Components
+  │  Example: createWorkflow(name) in actions/workflows/
+  │
+  └─ Use API Routes for: Third-party integrations, webhooks, OAuth
+     Location: app/api/ folder
+     Pattern: export async function POST(req, res)
+     Example: POST /api/gmail/callback (OAuth callback)
+
+AUTHENTICATION & AUTHORIZATION
+  ├─ Clerk handles: User signup/login/session management
+  ├─ Every Protected Route: Must check auth() from Clerk
+  │  Pattern: const { userId } = await auth()
+  │  Redirect if no userId: NextResponse.redirect("/sign-in")
+  │
+  └─ Multi-tenant Check: Verify userId matches resource owner
+     Pattern: WHERE { userId, id } (only return user's own data)
+
+DATABASE QUERIES
+  ├─ Use Prisma Client from lib/prisma.ts (singleton)
+  │  Pattern: import prisma from "@/lib/prisma"
+  ├─ Always filter by userId: WHERE { userId }
+  │  Prevents user from accessing other users' workflows
+  └─ Use Prisma select/include: Only fetch needed fields
+     Pattern: prisma.workflow.findUnique({
+       where: { id, userId },
+       select: { definition: true }
+     })
+
+REACT FLOW (Workflow Canvas)
+  ├─ State Management: useNodes(), useEdges() hooks (React Flow)
+  ├─ Don't persist mid-edit: Save only on "Save" button click
+  ├─ Node IDs: Must be stable across renders (don't use array indices)
+  └─ Custom Nodes: Extend NodeProps<NodeData> from @xyflow/react
+
+COMPONENT COMPOSITION
+  ├─ Props: Keep props minimal, use composition over boolean props
+  │  Bad:  <Card showTitle={true} showFooter={false} />
+  │  Good: <Card><CardTitle /><CardContent /></Card>
+  │
+  ├─ Extract Logic: Push logic to parent, keep components pure
+  │  Bad:  <NodeCard /> queries Prisma internally
+  │  Good: <NodeCard node={node} /> (passed from parent)
+  │
+  └─ Reusability: Build one-shot components if they're only used once
+     No need for premature abstraction
+
+ERROR HANDLING
+  ├─ Server Actions: Return { error: string } or { success: true }
+  │  Client: Check response and show toast
+  ├─ API Routes: Return NextResponse.json({ error }, { status: 40x/50x })
+  │  Client: Check response.ok before parsing JSON
+  └─ UI: Always show user-friendly error messages
+     Log full errors to console/logging service
+
+PERFORMANCE
+  ├─ Image Optimization: Use next/image, not <img>
+  ├─ Code Splitting: Use dynamic() for large components
+  │  Example: const FlowEditor = dynamic(() => import("./FlowEditor"))
+  ├─ Memoization: Use useMemo/useCallback sparingly (measure first)
+  └─ Polling: Use React Query, not setInterval
+     Example: const { data } = useQuery({ queryKey: [...], queryFn: ... })
+
+STYLE & THEMING
+  ├─ Use Tailwind CSS: No inline styles, no CSS modules in app/
+  ├─ Colors: Import from Tailwind, not hardcoded
+  ├─ Responsive: Mobile-first: sm:, md:, lg: breakpoints
+  └─ Component Shadows: Use shadcn/ui primitives (button, card, input, etc.)
+
+TESTING
+  ├─ Unit Tests: Test pure functions (executionPlan.ts)
+  ├─ Integration Tests: Test API routes with mock Prisma
+  └─ E2E Tests: Test full user flows (create workflow → run → monitor)
+
+GIT WORKFLOW
+  ├─ Commit Message: [feature|fix|docs|refactor|test] short description
+  │  Example: [feature] Add PipelineMonitor component for status tracking
+  ├─ PR Description: What changed, why, test instructions
+  └─ Code Review: Check TypeScript strictness, auth checks, SQL queries
+
+LOGGING & MONITORING
+  ├─ Server Logs: console.log for debugging, structured logging for prod
+  ├─ Client Logs: Browser console, Sentry for error tracking
+  └─ Performance: Use Next.js Analytics, Vercel Analytics
+
+DOCUMENTATION
+  ├─ JSDoc Comments: For public functions, explain params and returns
+  │  Bad:  // get workflow
+  │  Good: /** Fetch workflow by ID. Returns null if not found. */
+  ├─ Type Annotations: Always use explicit types, never `any`
+  └─ README: Update when adding new features or routes
+
+
+================================================================================
+9. NEXT.JS 16 SPECIFICS
+================================================================================
+
+APP ROUTER (Not Pages Router)
+  ├─ Route Structure: app/path/to/page.tsx = /path/to
+  ├─ Dynamic Routes: app/[id]/page.tsx = /:id (available in params)
+  ├─ Layout Groups: app/(group)/ = no URL segment
+  │  Example: (dashboard) doesn't add /dashboard to URL
+  ├─ Middleware: middleware.ts at root (auth checks)
+  └─ Error Handling: error.tsx for error boundaries
+
+SERVER COMPONENTS (Default)
+  ├─ Can: Await promises, access secrets, query databases
+  ├─ Cannot: Use hooks (useState, useEffect), "use client"
+  ├─ Must: Be async, return JSX or null
+  └─ Import Client: import ClientComponent from "@/components/..."
+
+CLIENT COMPONENTS
+  ├─ Must: Start with "use client" directive
+  ├─ Can: Use hooks, handle events, manage state
+  ├─ Cannot: Run secrets (they're sent to browser)
+  └─ Async: Use useEffect + setState or React Query, not async comp
+
+SERVER ACTIONS
+  ├─ Must: Start with "use server" (in function body or file)
+  ├─ Called from: Client components, forms, buttons
+  ├─ Pattern: async function actionName(formData) { ... }
+  └─ Return: JSON-serializable objects
+     (no File objects, Dates must be stringified)
+
+FORM HANDLING
+  ├─ Old way: <form> with submit handler
+  ├─ New way: <form action={serverAction}> (automatic)
+  ├─ Pending state: Use useFormStatus() hook
+  └─ Validation: Use Zod schema in server action
+
+CACHING STRATEGIES
+  ├─ Static: generateStaticParams() for [workflowId] routes
+  ├─ Dynamic: revalidatePath() after mutations
+  ├─ Incremental: revalidateTag() for fine-grained invalidation
+  └─ Client: React Query for API response caching
+
+FETCH & REVALIDATION
+  ├─ Server fetch: const res = await fetch(url, { next: { revalidate: 60 } })
+  ├─ Dynamic: fetch(..., { cache: 'no-store' })
+  ├─ After mutation: revalidatePath("/workflows") to refresh all
+  └─ ISR: revalidate: 60 in generateStaticParams for incremental
+
+DEPLOYED SPECIFICS
+  ├─ Environment: Use .env.local for secrets, .env for public vars
+  ├─ Database: DATABASE_URL must point to production Postgres
+  ├─ OAuth: Callback URL must use production domain
+  └─ Redis/Qdrant: May be behind private network (configure via env vars)
+
+
+================================================================================
+10. DEBUGGING & TROUBLESHOOTING
+================================================================================
+
+"Workflow won't save"
+  ├─ Check: Is React Flow state valid? (nodes have unique IDs)
+  ├─ Check: Is localStorage full? (clear browser storage)
+  └─ Fix: Validate flow definition before server action
+
+"OAuth callback fails"
+  ├─ Check: Is callback URL registered in provider?
+  ├─ Check: Are env vars (CLIENT_ID, CLIENT_SECRET) correct?
+  └─ Fix: Check OAuth provider settings (Google, GitHub, etc.)
+
+"Status doesn't update"
+  ├─ Check: Is Postgres responding? (check docker-compose)
+  ├─ Check: Is React Query polling? (check network tab)
+  └─ Fix: Manually refresh page to force API call
+
+"Search returns no results"
+  ├─ Check: Are documents actually processed? (check Email.status)
+  ├─ Check: Is Qdrant running? (http://localhost:6333/collections)
+  └─ Fix: Verify Python search API is running
+
+"Can't see other users' data"
+  ├─ Expected: WHERE { userId } filter prevents cross-user access
+  ├─ Check: This is correct RBAC behavior
+  └─ Each user sees only their workflows/connections
+
+"TypeScript errors on build"
+  ├─ Run: pnpm tsc --noEmit (to see all errors)
+  ├─ Check: Are all types imported from types/
+  └─ Fix: Add `// @ts-expect-error` only as last resort (document why)
+
+
+================================================================================
+END OF FRONTEND ARCHITECTURE DOCUMENT
+================================================================================
+
+This document is the master reference for frontend architecture. Update it
+whenever you:
+  - Add a new route
+  - Add a new component layer
+  - Change data model relationships
+  - Change authentication/authorization logic
+  - Change API contract
+
+Keep this in sync with the codebase. It's living documentation, not a relic.

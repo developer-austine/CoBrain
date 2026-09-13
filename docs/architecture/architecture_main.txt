@@ -1,0 +1,472 @@
+================================================================================
+COMPANY BRAIN — BACKEND ARCHITECTURE
+================================================================================
+Document type    : Technical architecture & onboarding reference
+Audience         : New engineers + AI coding agents continuing the build
+Scope            : BACKEND ONLY (Python pipeline + C++ bottlenecks + data flow)
+Excluded         : models/ and agents/ folders (documented separately later)
+Last updated     : Maintained alongside the codebase — update when structure changes
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+If you are a new engineer or an AI agent picking up this project, read sections
+in this order:
+
+  1. Section 1  — What Company Brain is (the mental model)
+  2. Section 2  — The three-backend split (why Python/C++/Next.js)
+  3. Section 3  — The end-to-end data flow (the single most important section)
+  4. Section 4  — The folder tree (where everything lives)
+  5. Section 5  — File-by-file description (what each file does)
+  6. Section 6  — The data contracts (the shapes that connect components)
+  7. Section 7  — What is built vs what remains (current state)
+  8. Section 8  — Conventions and rules (how to write code that fits)
+
+Do NOT start writing code until you understand Section 3. Every component in
+this backend exists to move a document through the pipeline described there.
+
+
+--------------------------------------------------------------------------------
+1. WHAT COMPANY BRAIN IS
+--------------------------------------------------------------------------------
+Company Brain is a Retrieval-Augmented Intelligence (RAI) platform. It ingests
+a company's entire distributed knowledge — Gmail, Notion, GitHub, custom
+internal APIs — and unifies it into a single searchable, analysable, and
+predictive intelligence layer.
+
+It supports three core capabilities:
+  - Conversational Q&A    : ask a question, get a cited answer from real company data
+  - Pattern analysis      : surface topics, sentiment, and anomalies across all data
+  - Predictive forecasting: forecast organisational outcomes from historical signals
+
+The system is specifically designed to handle up to 75 years of company data —
+meaning it must cope with documents from the 1950s (scanned, OCR'd, odd
+encodings) through to last week's Slack message. This historical depth is a
+core differentiator and shapes many design decisions in the normalisation layer.
+
+KEY MENTAL MODEL:
+  Next.js retrieves raw data from connectors and stages it.
+  Redis is the hand-off bus between Next.js and Python.
+  Python normalises, chunks, embeds, and stores the data.
+  Qdrant holds the final searchable vectors.
+  Postgres is the operational control plane (status tracking, staging, audit).
+
+
+--------------------------------------------------------------------------------
+2. THE THREE-BACKEND SPLIT
+--------------------------------------------------------------------------------
+This project deliberately uses three languages, each for what it is best at.
+
+  NEXT.JS (TypeScript)
+    Role     : Connector logic, OAuth, data retrieval, API routes, frontend.
+    Why      : I/O-bound work — talking to Gmail/Notion/GitHub APIs, handling
+               OAuth flows, serving the UI. Node's async model is ideal here.
+    Boundary : Next.js NEVER normalises or embeds. It retrieves raw data,
+               stages it in Postgres, and pushes it to Redis. That is all.
+
+  PYTHON (this backend)
+    Role     : The entire intelligence pipeline — normalise, chunk, embed,
+               deduplicate, store in Qdrant. Plus analysis and forecasting.
+    Why      : The mature ML/NLP ecosystem (spaCy, Presidio, sentence-
+               transformers, PyTorch) lives in Python. Rewriting it elsewhere
+               would cost months for no benefit.
+    Boundary : Python owns everything from "raw document on the queue" onward.
+
+  C++ (via pybind11)
+    Role     : Compute bottlenecks ONLY — profiled hot paths.
+    Why      : 10-100x speedups on tight loops (chunking, batched embedding,
+               MinHash hashing) at scale.
+    Boundary : C++ is called FROM Python as a compiled module (brain_cpp.so).
+               It is never an entry point. It optimises; it does not orchestrate.
+    Rule     : Do NOT write C++ until Python is profiled and the bottleneck is
+               proven. Premature C++ optimisation is the wrong move for the MVP.
+
+
+--------------------------------------------------------------------------------
+3. THE END-TO-END DATA FLOW  (READ THIS CAREFULLY)
+--------------------------------------------------------------------------------
+This is the spine of the entire system. Every backend file exists to serve one
+of these steps.
+
+  STEP 1 — RETRIEVAL (Next.js, not this backend)
+    A connector (Gmail/Notion/GitHub/Custom) fetches raw data from a source.
+    It saves each item to its Postgres staging table (Email, NotionPage,
+    GitHubItem, CustomDocument) with status = "PENDING".
+
+  STEP 2 — PUBLISH (Next.js → Redis)
+    Next.js shapes each staged item into a QueuePayload (see Section 6) and
+    LPUSHes it onto the Redis list key:  company_brain:ingest
+    It then updates the Postgres row status to "QUEUED".
+
+  STEP 3 — CONSUME (Python — workers/ingest.py)
+    A Celery worker does BRPOP on company_brain:ingest. It blocks until a
+    payload arrives, then wakes immediately and processes it.
+
+  STEP 4 — MAP (Python — mappers/)
+    The raw QueuePayload is converted into a unified RawDocument struct.
+    Each source has its own mapper because Gmail JSON != Notion JSON !=
+    GitHub JSON. The mapper is the translation layer that produces ONE
+    consistent shape regardless of source.
+
+  STEP 5 — NORMALISE (Python — pipeline/normaliser.py)
+    The RawDocument runs through the 8-stage normalisation pipeline:
+      1. Encoding repair + Unicode NFC
+      2. OCR artefact correction (for scanned historical docs)
+      3. Temporal normalisation (50+ date formats -> ISO 8601 + epoch days)
+      4. Text surface cleaning (whitespace, control chars, page breaks)
+      5. BM25 statistical weighting
+      6. Numerical / currency normalisation (CPI inflation adjustment)
+      7. (L2 vector normalisation happens later, in the embedder)
+      8. Content hashing + MinHash signature for dedup
+    Output: a NormalisedDocument struct.
+
+  STEP 6 — DEDUPLICATE (Python — pipeline/deduplicator.py)
+    The MinHash signature is checked against a Redis-backed LSH index.
+    If a near-duplicate exists (Jaccard >= 0.85), the document is skipped.
+    Otherwise its signature is added to the index and it proceeds.
+
+  STEP 7 — CHUNK (Python — pipeline/chunker.py)
+    The NormalisedDocument is split into overlapping 512-token windows
+    (102-token overlap). Each chunk inherits all parent metadata and records
+    its character offsets. Output: a list of Chunk structs.
+
+  STEP 8 — EMBED (Python — pipeline/embedder.py)
+    Chunks are batched (64 at a time) and embedded into 384-dim vectors using
+    all-MiniLM-L6-v2. Each vector is L2-normalised. Output: (chunk, vector) pairs.
+
+  STEP 9 — STORE (Python — db/qdrant.py, called by embedder)
+    Each (chunk, vector) pair is upserted into Qdrant with a full payload
+    (text, source, author, timestamp, namespace, offsets, parent_doc_id).
+    The 'namespace' field is the RBAC security boundary.
+
+  STEP 10 — CONFIRM (Python — db/postgres.py)
+    The Postgres staging row status is updated to "PROCESSED" (with a timestamp).
+    On any failure in steps 4-9, status is set to "FAILED" with an error message,
+    and the worker moves on to the next queue item without crashing.
+
+  END STATE:
+    Searchable vectors live in Qdrant. Postgres knows the status of every
+    document. The RAG engine (Section: agents, documented later) queries Qdrant
+    with a namespace filter to answer user questions.
+
+
+--------------------------------------------------------------------------------
+4. BACKEND FOLDER TREE
+--------------------------------------------------------------------------------
+This is the canonical structure. Keep it exactly like this.
+
+backend/
+│
+├── python/                         # The Python intelligence backend
+│   │
+│   ├── config.py                   # Central config — env vars, constants, settings.
+│   │                               #   EVERYTHING imports from here. No magic numbers
+│   │                               #   scattered across files. Single source of truth.
+│   │
+│   ├── pipeline/                   # The core document processing stages
+│   │   ├── __init__.py
+│   │   ├── normaliser.py           # 8-stage normalisation (ALREADY BUILT)
+│   │   ├── pii.py                  # PII detection + masking (spaCy + Presidio) (ALREADY BUILT)
+│   │   ├── chunker.py              # Recursive 512-token splitter w/ overlap (ALREADY BUILT)
+│   │   ├── embedder.py             # Batched embedding + L2 norm + Qdrant upsert (ALREADY BUILT)
+│   │   └── deduplicator.py         # MinHash LSH near-duplicate detection (Redis-backed)
+│   │
+│   ├── mappers/                    # Convert source-specific payloads -> RawDocument
+│   │   ├── __init__.py
+│   │   ├── base.py                 # Abstract base mapper + shared helpers
+│   │   ├── gmail.py                # Email staging row / payload -> RawDocument
+│   │   ├── notion.py               # NotionPage -> RawDocument
+│   │   ├── github.py               # GitHubItem -> RawDocument
+│   │   └── custom.py               # CustomDocument -> RawDocument
+│   │
+│   ├── workers/                    # Celery worker definitions + queue consumers
+│   │   ├── __init__.py
+│   │   ├── celery_app.py           # Celery app instance + Redis broker config
+│   │   ├── ingest.py               # MAIN consumer: BRPOP -> full pipeline -> Qdrant
+│   │   └── scheduler.py            # Periodic tasks (re-embed, cleanup, retries)
+│   │
+│   ├── db/                         # All database + vector store clients
+│   │   ├── __init__.py
+│   │   ├── postgres.py             # SQLAlchemy engine + status update helpers
+│   │   ├── qdrant.py               # Qdrant client + collection setup + upsert
+│   │   └── redis_client.py         # Redis connection (queue + LSH dedup index)
+│   │
+│   ├── schemas/                    # Dataclasses / Pydantic models (the contracts)
+│   │   ├── __init__.py
+│   │   ├── raw_document.py         # RawDocument — the unified input shape
+│   │   ├── normalised_document.py  # NormalisedDocument — normaliser output
+│   │   ├── chunk.py                # Chunk — chunker output
+│   │   └── queue_payload.py        # QueuePayload — the Next.js <-> Python contract
+│   │
+│   ├── utils/                      # Cross-cutting helpers
+│   │   ├── __init__.py
+│   │   ├── logging.py              # Structured logging config (used everywhere)
+│   │   ├── hashing.py              # SHA-256 + content hash helpers
+│   │   └── text.py                 # Small shared text utilities
+│   │
+│   ├── tests/                      # Unit + integration tests
+│   │   ├── __init__.py
+│   │   ├── test_normaliser.py
+│   │   ├── test_chunker.py
+│   │   ├── test_embedder.py
+│   │   ├── test_pii.py
+│   │   └── test_mappers.py
+│   │
+│   ├── requirements.txt            # Python dependencies
+│   ├── Dockerfile                  # Container for the Python workers
+│   └── .env.example                # Template for required env vars
+│
+├── cpp/                            # C++ compute bottlenecks (Phase 2 — profile first)
+│   ├── src/
+│   │   ├── chunker.cpp             # Fast recursive splitter (replaces python chunker)
+│   │   ├── embedder.cpp            # ONNX batched inference (optional optimisation)
+│   │   └── dedup.cpp               # SIMD MinHash hashing
+│   ├── bindings/
+│   │   └── brain_cpp.cpp           # pybind11 module — exposes C++ to Python
+│   ├── CMakeLists.txt              # Build config -> produces brain_cpp.so
+│   └── Dockerfile
+│
+└── docker-compose.yml              # Spins up Redis + Qdrant + Python workers
+                                    #   (Next.js runs separately via pnpm dev)
+
+
+--------------------------------------------------------------------------------
+5. FILE-BY-FILE DESCRIPTION
+--------------------------------------------------------------------------------
+
+=== python/config.py ===
+Central configuration. Reads all environment variables once and exposes them as
+typed constants. Includes: DATABASE_URL, REDIS_URL, QDRANT_URL, QUEUE_KEY
+("company_brain:ingest"), EMBEDDING_MODEL ("all-MiniLM-L6-v2"), EMBEDDING_DIM
+(384), CHUNK_SIZE (512), CHUNK_OVERLAP (102), BATCH_SIZE (64), DEDUP_THRESHOLD
+(0.85), MINHASH_NUM_HASHES (128). Every other file imports from here — never
+hardcode these values anywhere else.
+
+=== python/pipeline/normaliser.py === [ALREADY BUILT]
+The 8-stage normalisation pipeline. Input: RawDocument. Output:
+NormalisedDocument. Pure functions, no I/O, no model calls. Fully unit-testable
+in isolation. See Section 3 Step 5 for the stages. This is the most complex
+file in the pipeline and is already implemented.
+
+=== python/pipeline/pii.py === [ALREADY BUILT]
+PII detection and masking. Sits between normaliser Stage 4 and Stage 5
+(operates on clean text). Uses spaCy NER (en_core_web_trf) + Microsoft Presidio
+for pattern-based detection (emails, phones, IDs, cards, secrets). Two modes:
+pseudonymise (reversible — stores token<->original mapping in a restricted
+Postgres table) and redact (irreversible). MUST run before embedding so that
+no raw PII ever enters the vector store. Returns scrubbed text plus a mapping
+record for the audit table.
+
+=== python/pipeline/chunker.py === [ALREADY BUILT]
+Recursive character splitter. Input: NormalisedDocument. Output: list[Chunk].
+Splits on the best available boundary (paragraph > newline > sentence > comma >
+space), produces 512-token windows with 102-token overlap, attaches char
+offsets and inherits all parent metadata. Source-aware: respects email
+separators, Notion headings, etc. No model calls, no I/O — testable on plain
+strings. Strong candidate for C++ replacement at scale.
+
+=== python/pipeline/embedder.py === [ALREADY BUILT]
+Batched embedding + storage. Input: list[Chunk]. Loads the sentence-transformer
+model ONCE (singleton per worker — never reload per document). Batches chunks
+(64 at a time), encodes them, L2-normalises every vector, then upserts each
+(chunk, vector) pair into Qdrant via db/qdrant.py with full payload including
+the 'namespace' RBAC field. The only pipeline file that both runs a model AND
+writes to a store.
+
+=== python/pipeline/deduplicator.py ===
+MinHash LSH near-duplicate detection. Takes a NormalisedDocument's MinHash
+signature, checks it against a Redis-backed LSH index. If Jaccard >= 0.85 to an
+existing doc, returns True (skip). Otherwise adds the signature to the index and
+returns False (proceed). This replaces the is_near_duplicate() stub left in
+normaliser.py. Uses the datasketch library's MinHashLSH backed by redis_client.
+
+=== python/mappers/base.py ===
+Abstract base class defining the mapper interface: map(payload) -> RawDocument.
+Holds shared helpers (timestamp parsing, author extraction, namespace building).
+Every concrete mapper inherits from this.
+
+=== python/mappers/gmail.py / notion.py / github.py / custom.py ===
+One mapper per source. Each knows the exact JSON shape that its connector
+produces and converts it into the unified RawDocument. Example: gmail.py knows
+an email has 'from', 'subject', 'bodyText'; it maps from->author,
+bodyText->content, etc. This isolation means adding a new connector = adding one
+new mapper, nothing else changes.
+
+=== python/workers/celery_app.py ===
+Creates the Celery application, configures the Redis broker and result backend,
+sets task routing and concurrency. Imported by ingest.py and scheduler.py. This
+is the entry point that `celery -A workers.celery_app worker` boots.
+
+=== python/workers/ingest.py === [THE MAIN WORKER]
+The heart of the backend. Consumes from Redis (BRPOP), runs the full pipeline
+described in Section 3 (map -> normalise -> pii -> dedup -> chunk -> embed ->
+store -> confirm), and handles all error cases by setting Postgres status to
+FAILED with an error message rather than crashing. This is where all the
+pipeline files are wired together in sequence.
+
+=== python/workers/scheduler.py ===
+Celery Beat periodic tasks. Examples: retry FAILED documents, clean up old
+staging rows, re-embed documents if the embedding model is upgraded, refresh
+the dedup index. Not on the critical path — supporting maintenance jobs.
+
+=== python/db/postgres.py ===
+SQLAlchemy engine + session management for the existing Postgres database (the
+same DB Next.js writes to via Prisma). Provides helper functions to update
+document status (PENDING -> QUEUED -> PROCESSED / FAILED) and to write PII
+audit mappings. Python reads/writes the same tables Prisma defined — it does
+NOT own the schema, Prisma does.
+
+=== python/db/qdrant.py ===
+Qdrant client wrapper. Handles collection creation (with correct vector size =
+384 and cosine distance), and the upsert of (vector, payload) points. Centralises
+all Qdrant interaction so the embedder does not talk to Qdrant directly.
+
+=== python/db/redis_client.py ===
+Single Redis connection used for two purposes: (1) the ingest queue consumer
+(BRPOP), and (2) the MinHash LSH dedup index. Centralising the connection avoids
+multiple clients per worker.
+
+=== python/schemas/*.py ===
+The data contracts as dataclasses (or Pydantic models). raw_document.py,
+normalised_document.py, chunk.py, queue_payload.py. These ARE the interfaces
+between components. If you change a schema, you change every component that
+touches it — so changes here are deliberate and rare. See Section 6.
+
+=== python/utils/*.py ===
+logging.py (structured JSON logging used by every module), hashing.py (SHA-256
+content hashing), text.py (small shared text helpers). Pure utilities, no
+business logic.
+
+=== python/tests/*.py ===
+One test file per pipeline component. The normaliser, chunker, pii, and mappers
+are all pure functions and must have full unit coverage. The embedder and db
+layers need integration tests against a local Qdrant/Postgres.
+
+
+--------------------------------------------------------------------------------
+6. DATA CONTRACTS (THE SHAPES THAT CONNECT EVERYTHING)
+--------------------------------------------------------------------------------
+These are the exact shapes passed between components. Treat them as frozen
+interfaces — both Next.js and Python depend on QueuePayload matching exactly.
+
+QueuePayload   (Next.js produces -> Redis -> Python consumes)
+  rawDocumentId    : str    # Postgres staging row ID — Python updates status here
+  source           : str    # "gmail" | "notion" | "github" | "custom"
+  externalId       : str    # provider's native ID
+  author           : str
+  subject          : str?   # optional (email subject / doc title)
+  content          : str    # the full raw text body
+  timestamp        : str    # ISO 8601 UTC
+  metadata         : dict   # provider-specific extras
+  connectorId      : str    # which connection this came from
+  namespace        : str    # "userId:scope" — RBAC boundary, flows all the way to Qdrant
+
+RawDocument    (mapper produces -> normaliser consumes)
+  content          : str | bytes
+  source           : str
+  author           : str
+  timestamp        : str
+  metadata         : dict
+
+NormalisedDocument  (normaliser produces -> chunker consumes)
+  content          : str
+  source           : str
+  author           : str
+  timestamp_iso    : str
+  timestamp_epoch  : int
+  word_count       : int
+  bm25_lengths     : dict
+  content_hash     : str    # SHA-256
+  minhash_sig      : list[int]   # 128 values
+  metadata         : dict
+
+Chunk          (chunker produces -> embedder consumes)
+  text             : str
+  chunk_index      : int
+  total_chunks     : int
+  char_start       : int
+  char_end         : int
+  token_count      : int
+  parent_doc_id    : str
+  source           : str
+  author           : str
+  timestamp_iso    : str
+  timestamp_epoch  : int
+  namespace        : str
+  content_hash     : str
+
+Qdrant point payload  (embedder writes -> RAG engine reads)
+  text, source, author, timestamp_iso, timestamp_epoch,
+  namespace, chunk_index, total_chunks, parent_doc_id, content_hash
+
+
+--------------------------------------------------------------------------------
+7. CURRENT STATE — BUILT vs REMAINING
+--------------------------------------------------------------------------------
+BUILT (Next.js side — outside this backend):
+  [x] Gmail connector (auth, callback, status, sync routes + Prisma models)
+  [x] Notion connector (auth, callback, status, sync routes + Prisma models)
+  [x] GitHub connector
+  [x] Custom API connector
+  [x] React Flow connector canvas UI
+  [x] Postgres staging tables for all four connectors
+
+BUILT (this backend):
+  [x] pipeline/normaliser.py  — the 8-stage normaliser
+  [x] pipeline/pii.py          — PII scrubber
+  [x] pipeline/chunker.py      — the splitter
+  [x] pipeline/embedder.py     — embedding + Qdrant upsert
+
+REMAINING (this backend — build in this order):
+  [x] config.py                — central config: all constants, env vars, settings
+  [x] schemas/*.py             — RawDocument, NormalisedDocument, Chunk, QueuePayload
+  [x] db/redis_client.py       — queue BRPOP and LSH dedup index
+  [x] db/postgres.py           — status updates and document retrieval
+  [x] db/qdrant.py             — collection management and upsert
+  [x] mappers/*.py             — GmailMapper, NotionMapper, GitHubMapper, CustomMapper
+  [x] pipeline/deduplicator.py — MinHash LSH near-duplicate detection
+  [x] workers/celery_app.py    — Celery config and periodic task scheduling
+  [x] workers/ingest.py        — main consumer: full 10-step pipeline
+  [x] workers/scheduler.py     — retry failures, cleanup old staging, refresh indices
+  [x] docker-compose.yml       — Redis + Qdrant + PostgreSQL + workers + beat scheduler
+  [x] requirements.txt         — all Python dependencies
+  [x] Dockerfile               — containerised Python worker
+  [x] .env.example             — template for required env vars
+
+DEFERRED (documented separately — DO NOT build yet):
+  [ ] models/   — PyTorch LSTM autoencoder + Temporal Fusion Transformer
+  [ ] agents/   — RAG engine, analysis agent, forecast engine, voice/meeting agents
+
+RECOMMENDED BUILD SEQUENCE:
+  config.py -> schemas -> db clients -> mappers -> deduplicator -> celery_app -> ingest worker -> docker-compose -> test
+  end to end with one real document -> then scheduler -> then optimise with C++.
+
+
+--------------------------------------------------------------------------------
+8. CONVENTIONS & RULES
+--------------------------------------------------------------------------------
+  - SINGLE SOURCE OF CONFIG: all constants live in config.py. Never hardcode.
+  - PYTHON OWNS POST-QUEUE: Python never calls Gmail/Notion/etc directly. It only
+    ever reads from Redis and the Postgres staging tables. Retrieval is Next.js.
+  - SCHEMA IS PRISMA'S: Python reads/writes Postgres but does not define or migrate
+    the schema. Prisma (Next.js) owns migrations. Python uses SQLAlchemy reflection
+    or a matching model definition.
+  - NAMESPACE IS SACRED: the 'namespace' field flows from QueuePayload all the way
+    into the Qdrant payload. It is the RBAC boundary. Never drop it, never default
+    it to a shared value. Every Qdrant search MUST filter on it.
+  - PII BEFORE EMBED: no raw PII may ever reach Qdrant. pii.py runs before chunker.
+  - MODEL LOADED ONCE: the embedding model is a per-worker singleton. Never load
+    it inside a per-document function.
+  - FAIL SOFT: a single bad document must never crash the worker. Catch, set status
+    FAILED with the error message, move on.
+  - CURSOR/STATUS ATOMICITY: only mark a document PROCESSED after it is confirmed
+    in Qdrant. Only advance status after the work is actually done.
+  - C++ LAST: do not write C++ until Python is profiled and a bottleneck is proven.
+  - PURE PIPELINE FUNCTIONS: normaliser, chunker, pii, mappers do no I/O. They are
+    pure transforms and must be unit-testable without a database or model.
+
+================================================================================
+END OF ARCHITECTURE DOCUMENT
+================================================================================

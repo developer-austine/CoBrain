@@ -1,0 +1,845 @@
+// Business Logic - Docker Postgres
+generator client {
+  provider        = "prisma-client-js"
+  output          = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Auth Tables Managed by Better Auth in Neon
+// (User, Session, Account, Verification)
+// These are NOT in this schema - Better Auth manages them directly
+
+model GitHubConnection {
+  id           String   @id @default(uuid())
+  workflowId   String
+  nodeId       String
+  userId       String
+  accessToken  String
+  // "owner/repo". Empty until the user picks a repo — OAuth grants access to
+  // every repo they can see, so linking is a separate, explicit step.
+  repository   String
+  repoId       String?
+  defaultBranch String?
+  isPrivate    Boolean  @default(false)
+  linkedAt     DateTime?
+
+  // Incremental cursors. Commits and code advance independently: a push
+  // changes both, but a code re-index is far more expensive than a commit
+  // page, so they must not be forced to run together.
+  lastCommitSha   String?
+  commitsSyncedAt DateTime?
+  codeSyncedAt    DateTime?
+  codeTreeSha     String?
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  items        GitHubItem[]
+
+  @@unique([workflowId, nodeId])
+  @@index([userId])
+}
+
+model CustomConnection{
+  id String @id @default(uuid())
+  userId String
+  workflowId String
+  nodeId String
+  name String
+
+  clientId String @unique @default(uuid())
+  clientSecret String
+
+  status String @default("PENDING")
+  lastSyncAt DateTime?
+  lastSyncError String?
+
+  webhookUrl String?
+  webhookSecret String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  documents CustomDocument[]
+  syncCursor CustomSyncCursor?
+
+  @@unique([workflowId, nodeId])
+  @@index([userId])
+}
+
+model CustomDocument {
+  userId String @default("")
+  id String @id @default(uuid())
+  connectionId String
+  connection CustomConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  externalId String
+  contentHash String
+  source String
+
+  status String @default("PENDING")
+  errorMessage String?
+
+  rawPayload Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  queuedAt DateTime?
+  processedAt DateTime?
+
+  @@unique([connectionId, externalId])
+  @@index([status])
+  @@index([userId])
+}
+
+model CustomSyncCursor {
+  userId String @default("")
+  id String @id @default(uuid())
+  connectionId String @unique
+  connection CustomConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  cursor String
+  updatedAt DateTime @updatedAt
+}
+
+model GitHubItem {
+  id                  String   @id @default(uuid())
+  githubConnectionId  String
+  userId              String   @default("")
+  githubItemId        String
+  // "issue" | "pr" | "commit" | "discussion" | "code" | "commit_summary".
+  // One table because every kind carries the same pipeline status fields and
+  // resolves through the same `github` source mapping in the Python worker.
+  type                String
+  title               String?
+  body                String?
+  state               String?
+  author              String?
+  url                 String?
+  labels              String[]
+  createdAt           DateTime?
+  updatedAt           DateTime?
+  syncedAt            DateTime @default(now())
+
+  // --- commit-specific ---
+  sha                 String?
+  additions           Int?
+  deletions           Int?
+  changedFiles        Int?
+
+  // --- code-specific ---
+  path                String?
+  language            String?
+  sizeBytes           Int?
+
+  // Pipeline orchestration tracking properties
+  status              String   @default("PENDING") 
+  errorMessage        String?
+  queuedAt            DateTime?
+  processedAt         DateTime?
+
+  connection          GitHubConnection @relation(fields: [githubConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([githubConnectionId, githubItemId, type])
+  @@index([status]) // Added query performance indexing
+  @@index([githubConnectionId, type])
+  @@index([githubConnectionId, author])
+  @@index([userId])
+}
+
+model GmailConnection {
+  id           String    @id @default(uuid())
+  workflowId   String
+  nodeId       String
+  userId       String
+  accessToken  String
+  refreshToken String?
+  tokenExpiry  DateTime?
+  email        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  emails       Email[]
+
+  @@unique([workflowId, nodeId])
+  @@index([userId])
+}
+
+model Email {
+  id                String    @id @default(uuid())
+  gmailConnectionId String
+  userId            String   @default("")
+  gmailMessageId    String
+  subject           String?
+  from              String?
+  to                String?
+  date              DateTime?
+  snippet           String?
+  bodyText          String?
+  bodyHtml          String?
+  labelIds          String[]
+  threadId          String?
+  syncedAt          DateTime  @default(now())
+
+  // Pipeline orchestration tracking properties
+  status            String    @default("PENDING")
+  errorMessage      String?
+  queuedAt          DateTime?
+  processedAt       DateTime?
+
+  connection        GmailConnection @relation(fields: [gmailConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([gmailConnectionId, gmailMessageId])
+  @@index([status]) // Added query performance indexing
+  @@index([userId])
+}
+
+model Workflow {
+  id          String   @id @default(uuid())
+  userId      String
+  name        String
+  description String?
+  definition  String
+  status      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workflowExecutions WorkflowExecution[]
+
+  outgoingLinks WorkflowLink[] @relation("LinkSource")
+  incomingLinks WorkflowLink[] @relation("LinkTarget")
+
+  @@unique([name, userId])
+  @@index([userId])
+}
+
+/// A directed knowledge link between two workflows.
+///
+/// `source -> target` means: the TARGET workflow may also search the SOURCE
+/// workflow's ingested knowledge. Links are transitive (A->B->C lets C read A)
+/// and must stay acyclic — see lib/workflow/knowledgeScope.ts.
+model WorkflowLink {
+  id               String   @id @default(uuid())
+  userId           String
+  sourceWorkflowId String
+  targetWorkflowId String
+  createdAt        DateTime @default(now())
+
+  sourceWorkflow Workflow @relation("LinkSource", fields: [sourceWorkflowId], references: [id], onDelete: Cascade)
+  targetWorkflow Workflow @relation("LinkTarget", fields: [targetWorkflowId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceWorkflowId, targetWorkflowId])
+  @@index([userId])
+  @@index([targetWorkflowId])
+}
+
+model NotionConnection {
+  id            String   @id @default(uuid())
+  workflowId    String
+  nodeId        String
+  userId        String
+
+  accessToken   String
+
+  workspaceName String?
+  workspaceId   String?
+  botId         String?
+
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  pages         NotionPage[]
+  syncCursors   NotionSyncCursor[]
+
+  @@unique([workflowId, nodeId])
+  @@index([userId])
+}
+
+model NotionPage {
+  userId             String   @default("")
+  id                  String   @id @default(uuid())
+  notionConnectionId  String
+
+  notionPageId        String
+  notionEditedTime    String   // ISO 8601 — used as dedup key and cursor
+
+  // Content
+  title               String?
+  plainText           String?  // full flattened block tree content
+  snippet             String?  // first 200 chars for quick verification in DB viewer
+
+  // Metadata
+  createdByName       String?
+  parentType          String?  // "workspace" | "page_id" | "database_id"
+  url                 String?
+
+  syncedAt            DateTime @default(now())
+
+  // Pipeline orchestration tracking properties
+  status              String   @default("PENDING")
+  errorMessage        String?
+  queuedAt            DateTime?
+  processedAt         DateTime?
+
+  connection          NotionConnection @relation(fields: [notionConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([notionConnectionId, notionPageId])
+  @@index([status]) // Added query performance indexing
+  @@index([userId])
+}
+
+model NotionSyncCursor {
+  userId String @default("")
+  id           String   @id @default(uuid())
+  connectionId String
+  subSource    String   // "notion" — extensible per-database later
+  cursor       String   // ISO 8601 datetime of the most recently edited page synced
+  updatedAt    DateTime @updatedAt
+
+  connection   NotionConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@unique([connectionId, subSource])
+}
+
+model WorkflowExecution {
+  id String @id @default(cuid())
+  workflowId String
+  userId String
+  trigger String
+  status String
+  createdAt DateTime @default(now())
+  startedAt DateTime?
+  completedAt DateTime?
+
+  workflow Workflow @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+
+  executionPhases ExecutionPhase[]
+
+  @@index([userId])
+}
+
+model ExecutionPhase {
+  id String @id @default(cuid())
+  userId String
+  status String
+  number Int
+  node String
+  name String
+  startedAt DateTime?
+  completedAt DateTime?
+  inputs String?
+  outputs String?
+
+  creditCost Int?
+
+  workflowExecutionId String
+  execution WorkflowExecution @relation(fields: [workflowExecutionId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+// ─── Chat history ────────────────────────────────────────────────────────────
+// Persisted RAG chat conversations so answers (and their citations) survive
+// page reloads and are browsable from the Chat Logs page.
+
+model ChatConversation {
+  id        String   @id @default(cuid())
+  userId    String
+  title     String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages ChatMessage[]
+
+  @@index([userId, updatedAt(sort: Desc)])
+}
+
+model ChatMessage {
+  userId String @default("")
+  id             String   @id @default(cuid())
+  conversationId String
+  role           String // "user" | "assistant"
+  content        String
+  citations      Json? // Citation[] captured at answer time
+  createdAt      DateTime @default(now())
+
+  conversation ChatConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+  @@index([userId])
+}
+
+// ─── Onboarding ──────────────────────────────────────────────────────────────
+// Captured once after signup; drives the auto-generated starter workflow.
+
+model CompanyProfile {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  companyName String
+  companySize String
+  // Presentation only: picks the industry's label pack for forecast signals.
+  // Nullable because profiles created before this field existed have no answer,
+  // and a guessed industry is worse than none — the UI falls back to neutral.
+  industry    String?
+  sources     String[] // connector keys chosen during onboarding (gmail, notion, …)
+  plan        String? // chosen at the final onboarding step (free/starter/pro/scale)
+  workflowId  String? // the workflow generated from those choices
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ─── Interactive intelligence layer ─────────────────────────────────────────
+// Blueprint: @-commands, intent routing, standing agent rules, and the Brain
+// (derived knowledge) with provenance + reversibility.
+
+// A standing behaviour rule created by a CONFIG prompt ("configure yourself
+// as..."). Event-driven: domain events matching `triggers` fire the action.
+model AgentConfig {
+  id          String   @id @default(cuid())
+  userId      String
+  name        String
+  triggers    String[] // e.g. ["meeting_attended", "tft_forecast_completed"]
+  action      String // e.g. "summarise_and_write"
+  writeTarget String // e.g. "brain"
+  persistence String   @default("permanent") // "permanent" | "until_date"
+  extraFlags  Json?
+  enabled     Boolean  @default(true)
+  sourceText  String // the original prompt, for the config management UI
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId, enabled])
+}
+
+// One unit of derived knowledge on the Brain page. Append-only versioning:
+// edits create a new row with version+1 and supersededById links the chain.
+model BrainBlock {
+  id             String    @id @default(cuid())
+  userId         String
+  type           String // meeting_summary | forecast | learned_fact | pattern | decision | brief | note
+  title          String
+  body           String
+  data           Json?
+  sourceRefs     Json? // provenance: which docs/meetings/prompts produced this
+  confidence     Float     @default(1)
+  createdBy      String    @default("ai") // "ai" | "human"
+  status         String    @default("active") // active | queued_for_review | archived
+  pinned         Boolean   @default(false)
+  humanVerified  Boolean   @default(false)
+  version        Int       @default(1)
+  supersededById String? // set on OLD row when a correction supersedes it
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([userId, status, type])
+  @@index([userId, pinned])
+}
+
+// An uploaded external source (Sources page). Reuses the connector lifecycle.
+model SourceFile {
+  id             String    @id @default(cuid())
+  userId         String
+  fileName       String
+  mimeType       String
+  storageKey     String // object-storage key (MinIO)
+  sizeBytes      Int
+  status         String    @default("PENDING") // PENDING | QUEUED | PROCESSED | FAILED
+  extractedChars Int?
+  errorMessage   String?
+  scope          String    @default("unified") // "unified" | "isolated:<name>"
+  createdAt      DateTime  @default(now())
+  queuedAt       DateTime?
+  processedAt    DateTime?
+
+  // Knowledge extraction is tracked separately from the embedding pipeline
+  // above: a file can be searchable (QUEUED/PROCESSED) while the brain has not
+  // read it yet, and the two fail independently.
+  // PENDING | RUNNING | DONE | FAILED
+  brainStatus    String    @default("PENDING")
+  brainError     String?
+  brainBlocks    Int       @default(0)
+  brainAt        DateTime?
+
+  @@index([userId, status])
+  @@index([userId, brainStatus])
+}
+
+// Audit of every interactive prompt and how it was routed.
+model PromptEvent {
+  id          String   @id @default(cuid())
+  userId      String
+  rawText     String
+  references  Json? // parsed @mentions [{type,id,label,pos}]
+  intent      String // QUERY | CONFIG | WRITE
+  model       String? // selected @model, if any
+  inputMethod String   @default("typed") // "typed" | "voice"
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+// Scheduler bookkeeping for automatic connector refresh.
+//
+// One row per (source, connection). Kept in its own table rather than as
+// columns on each *Connection model so a new source needs no migration, and so
+// the scheduler can read every connector's freshness in a single query.
+// Cadence itself lives in lib/connector/sync/policy.ts.
+model ConnectorSyncState {
+  id           String @id @default(uuid())
+  userId       String
+  source       String // gmail | notion | github | slack | drive
+  connectionId String
+
+  /// Last SUCCESSFUL sync — drives the "is it due?" check.
+  lastSyncedAt DateTime?
+  /// Set when a run starts, cleared when it ends. Presumed dead after
+  /// SYNC_LOCK_TIMEOUT_MS so a crashed run can't wedge a source forever.
+  syncingSince DateTime?
+
+  /// Observability for the last attempt.
+  lastStatus    String? // ok | error
+  lastError     String?
+  lastItemCount Int?
+  /// Consecutive failures — lets us back off a persistently broken connector.
+  failureCount Int @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([source, connectionId])
+  @@index([userId])
+}
+
+
+/// Per-tenant envelope encryption keys (Scaling module C1).
+///
+/// Data keys are stored ONLY wrapped by the master key. Deleting the wrapped
+/// key crypto-shreds the tenant: their content becomes unrecoverable everywhere
+/// the key was needed, including backups.
+model TenantKey {
+  id         String   @id @default(uuid())
+  userId     String
+  wrappedKey Bytes?
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  shreddedAt DateTime?
+  /// Attestation of the shred, kept after the key is gone as the audit record.
+  shredReason String?
+
+  @@index([userId])
+  @@index([userId, active])
+}
+
+/// Weekly drift tripwire output (Scaling module A4).
+model DriftReport {
+  id               String   @id @default(uuid())
+  userId           String
+  week             DateTime
+  target           String
+  coverage12w      Float?
+  worstPsiFeature  String?
+  worstPsiValue    Float?
+  /// "ok" | "drifting" | "alarm"
+  status           String   @default("ok")
+  createdAt        DateTime @default(now())
+
+  @@unique([userId, week, target])
+  @@index([userId, status])
+}
+
+/// Versioned per-tenant normalisation statistics (Scaling module A3).
+///
+/// A forecast may only be served when scaled with the stats version its model
+/// was trained against; mixing versions is an error, not a warning.
+model NormStats {
+  id          String   @id @default(uuid())
+  userId      String
+  version     Int
+  windowStart DateTime
+  windowEnd   DateTime
+  /// {feature: [mu, sd]}
+  payload     Json
+  fingerprint String
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, version])
+  @@index([userId])
+}
+
+/// Append-only access log (Scaling module C5). Shipped hourly to WORM storage.
+model AuditEvent {
+  id         String   @id @default(uuid())
+  userId     String
+  actorId    String
+  action     String
+  objectKey  String?
+  sourceIp   String?
+  userAgent  String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([action])
+}
+
+/// Slack workspace authorisation (OAuth v2 bot token).
+///
+/// One row per workflow node, matching every other connector: the same
+/// workspace can be wired into two workflows independently, and revoking one
+/// must not silently kill the other.
+model SlackConnection {
+  id          String   @id @default(uuid())
+  workflowId  String
+  nodeId      String
+  userId      String
+
+  /// Bot token (xoxb-…). Slack bot tokens do not expire, so there is no
+  /// refresh token to store — unlike Google, a null here means genuinely
+  /// unauthorised rather than merely stale.
+  accessToken String
+  /// User token (xoxp-…), only present when the install requested user scopes.
+  userToken   String?
+
+  teamId      String?
+  teamName    String?
+  botUserId   String?
+  scope       String?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  messages    SlackMessage[]
+
+  @@unique([workflowId, nodeId])
+  @@index([userId])
+}
+
+/// One ingested Slack message.
+///
+/// Threads are kept as individual messages rather than being flattened into
+/// the parent: a reply carries its own author and timestamp, and collapsing a
+/// 40-reply thread into one document loses who said what.
+model SlackMessage {
+  id                String    @id @default(uuid())
+  slackConnectionId String
+  userId            String    @default("")
+
+  /// Slack's per-channel message id (`ts`). Unique only within a channel,
+  /// which is why the unique key below carries the channel too.
+  messageTs         String
+  channelId         String
+  channelName       String?
+  /// Set on replies — the parent message's ts.
+  threadTs          String?
+
+  authorId          String?
+  authorName        String?
+  text              String?
+  permalink         String?
+  postedAt          DateTime?
+
+  syncedAt          DateTime  @default(now())
+
+  // Pipeline orchestration tracking properties
+  status            String    @default("PENDING")
+  errorMessage      String?
+  queuedAt          DateTime?
+  processedAt       DateTime?
+
+  connection        SlackConnection @relation(fields: [slackConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([slackConnectionId, channelId, messageTs])
+  @@index([status])
+  @@index([userId])
+  @@index([slackConnectionId, channelId])
+}
+
+/// Google Drive authorisation.
+///
+/// Separate from GmailConnection despite sharing a Google OAuth client: the
+/// scopes differ, so a Gmail grant cannot read Drive and vice versa. Merging
+/// them would mean one revoked consent silently disabling both.
+model DriveConnection {
+  id           String    @id @default(uuid())
+  workflowId   String
+  nodeId       String
+  userId       String
+
+  accessToken  String
+  refreshToken String?
+  tokenExpiry  DateTime?
+  email        String?
+
+  /// Drive's change-feed cursor. Present once the first full walk completes;
+  /// from then on syncs read only what actually changed.
+  startPageToken String?
+
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  files        DriveFile[]
+
+  @@unique([workflowId, nodeId])
+  @@index([userId])
+}
+
+/// One ingested Drive file's extracted text.
+model DriveFile {
+  id                String    @id @default(uuid())
+  driveConnectionId String
+  userId            String    @default("")
+
+  fileId            String
+  name              String?
+  mimeType          String?
+  /// Drive's own version counter — the dedup key. A file whose version has
+  /// not moved has not changed, however many times we walk past it.
+  version           String?
+  webViewLink       String?
+  ownerName         String?
+  modifiedTime      DateTime?
+  sizeBytes         Int?
+
+  plainText         String?
+  snippet           String?
+
+  syncedAt          DateTime  @default(now())
+
+  // Pipeline orchestration tracking properties
+  status            String    @default("PENDING")
+  errorMessage      String?
+  queuedAt          DateTime?
+  processedAt       DateTime?
+
+  connection        DriveConnection @relation(fields: [driveConnectionId], references: [id], onDelete: Cascade)
+
+  @@unique([driveConnectionId, fileId])
+  @@index([status])
+  @@index([userId])
+}
+
+// ============================================================================
+// USAGE METERING & CREDITS (metering module)
+//
+// LAW 1 — THE LEDGER IS TRUTH. Every billable action writes ONE immutable row
+// to UsageEvent. Rows are never updated or deleted; a correction is a NEW row
+// with negative credits. Balances are DERIVED from these tables, and Redis is
+// only ever a cache of that derivation.
+//
+// `tenantId` rather than the `userId` used by the older tables: the ledger has
+// to name the payer and the person separately (`actorUserId`), and conflating
+// them would make the per-user breakdown impossible to add later. Today a
+// tenant id IS a Better Auth user id, so the RLS policies compare it against
+// the same `app.tenant_id` setting every other table uses.
+// ============================================================================
+
+/// Append-only usage ledger — the heart of the metering module.
+///
+/// NEVER UPDATE OR DELETE A ROW. Corrections are new rows with negative
+/// `credits`, `metadata.reason = "correction"` and `metadata.correctsEventId`.
+model UsageEvent {
+  id             String   @id @default(cuid())
+  tenantId       String
+  /// Null for system or scheduled work that no person triggered.
+  actorUserId    String?
+  /// One of the PRICE_BOOK keys — see lib/metering/pricebook.ts.
+  feature        String
+  /// In the feature's native unit, before the price book is applied.
+  quantity       Decimal  @db.Decimal(20, 6)
+  /// "minute" | "kchar" | "kdoc" | "month" | "run" | "krequest"
+  unit           String
+  /// The customer-facing charge. The only money-shaped number a customer sees.
+  credits        Decimal  @db.Decimal(20, 6)
+  /// OUR real cost in micro-USD. INTERNAL ONLY — never leaves the server.
+  costMicros     BigInt
+  /// LAW 3. Deterministic, caller-supplied; the unique index is what makes a
+  /// retry a no-op instead of a double charge.
+  idempotencyKey String   @unique
+  metadata       Json     @default("{}")
+  occurredAt     DateTime @default(now())
+
+  @@index([tenantId, occurredAt])
+  @@index([tenantId, feature, occurredAt])
+  @@index([tenantId, actorUserId, occurredAt])
+}
+
+/// Grants, purchases, adjustments and expiries. Also append-only.
+model CreditLedger {
+  id             String    @id @default(cuid())
+  tenantId       String
+  /// "plan_allowance" | "purchase" | "adjustment" | "expiry"
+  kind           String
+  /// Positive adds credits; expiries and clawbacks are negative.
+  credits        Decimal   @db.Decimal(20, 6)
+  periodStart    DateTime?
+  periodEnd      DateTime?
+  idempotencyKey String    @unique
+  note           String?
+  createdAt      DateTime  @default(now())
+
+  @@index([tenantId, createdAt])
+}
+
+/// Current plan and spend policy. The ONLY mutable table in this module.
+model TenantBilling {
+  tenantId        String   @id
+  /// "starter" | "growth" | "enterprise"
+  plan            String   @default("starter")
+  includedCredits Decimal  @default(0) @db.Decimal(20, 6)
+  periodStart     DateTime
+  periodEnd       DateTime
+  /// Admin-set spend ceiling for the period; null = no cap.
+  hardCapCredits  Decimal? @db.Decimal(20, 6)
+  alertThresholds Int[]    @default([75, 90])
+  overageAllowed  Boolean  @default(true)
+  /// Per-feature ceilings in credits, e.g. {"meeting_agent": 600}.
+  featureCaps     Json     @default("{}")
+  updatedAt       DateTime @updatedAt
+
+  @@index([periodEnd])
+}
+
+/// One row per threshold crossed per period, so an alert fires exactly once.
+///
+/// Not in the original three tables, but /api/usage/summary has to return
+/// `alerts[]` and the once-per-threshold-per-period guarantee needs somewhere
+/// to hold the idempotency key. Append-only like the ledgers.
+model UsageAlert {
+  id             String   @id @default(cuid())
+  tenantId       String
+  /// The threshold percentage that was crossed (75, 90, 100).
+  threshold      Int
+  /// ISO date of the period start this alert belongs to.
+  period         String
+  /// Percentage of the allowance actually used when it fired.
+  usedPct        Int
+  idempotencyKey String   @unique
+  notifiedAt     DateTime?
+  createdAt      DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+}
+
+/// Weekly per-tenant margin snapshot. INTERNAL ONLY — never served to a
+/// customer, and deliberately NOT tenant-scoped for reads: the whole point is
+/// to compare tenants against each other.
+model MarginReport {
+  id             String   @id @default(cuid())
+  tenantId       String
+  weekStart      DateTime
+  revenueMicros  BigInt
+  costMicros     BigInt
+  /// (revenue - cost) / revenue. Null when revenue is zero.
+  marginPct      Float?
+  topCostFeature String?
+  seats          Int      @default(1)
+  costPerSeat    BigInt   @default(0)
+  /// True once margin has been under 40% for two consecutive weeks.
+  flagged        Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  @@unique([tenantId, weekStart])
+  @@index([weekStart])
+}

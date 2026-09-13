@@ -1,0 +1,970 @@
+================================================================================
+COBRAIN — TFT FORECASTING ENGINE
+FULL IMPLEMENTATION SPECIFICATION FOR THE ENGINEERING AGENT
+================================================================================
+Target folder    : m_learning/
+Document type    : Executable build specification
+Audience         : The AI agent implementing this. Read fully before writing code.
+Status           : Authoritative. Supersedes all prior TFT code in this project.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. AGENT — READ THIS FIRST
+--------------------------------------------------------------------------------
+You are building the forecasting engine for CoBrain inside a folder named
+`m_learning/`. Prior TFT code exists in this project; it is a partial draft and
+MUST be corrected per Section 2. Do not preserve it as-is.
+
+Rules for this build:
+  - Build the FULL structure in Section 3. Every file listed must exist.
+  - Follow the build order in Section 12. Do not skip ahead.
+  - Tensor shapes are specified at every boundary. Assert them in code.
+  - Where code is given in this document, use it as written.
+  - Where only a spec is given, implement to the spec and match the conventions
+    of the given code.
+  - Do not ask clarifying questions about anything specified here.
+
+WHAT THIS SYSTEM DOES
+  One global Temporal Fusion Transformer forecasts organisational trajectories
+  (burnout risk, delivery velocity, cash-flow, churn, and more) for MANY tenant
+  companies across different industries and countries. It outputs three quantiles
+  per future week — Bear (P10), Base (P50), Bull (P90) — plus interpretability
+  weights explaining what drove the forecast.
+
+
+--------------------------------------------------------------------------------
+1. THE CORE DESIGN DECISIONS (do not deviate)
+--------------------------------------------------------------------------------
+
+DECISION 1 — ONE GLOBAL MODEL, CONDITIONED. NOT ONE MODEL PER TENANT.
+  A single model serves every tenant. Company identity enters through STATIC
+  COVARIATES (industry, country, size band, currency), not separate models.
+  This is what produces cross-tenant learning: patterns learned from the whole
+  fleet improve every tenant's forecast. It is the core competitive moat.
+
+DECISION 2 — THREE TIERS, THREE DISTINCT MECHANISMS.
+  Tier 1 UNIVERSAL   -> sequence encoder    -> produces base trajectory z_t
+  Tier 2 INDUSTRY    -> feature mask        -> produces gate m_ind
+  Tier 3 GEOGRAPHY   -> static latent + time-varying channel -> e_geo and g_t
+
+  These map onto the model's three native input channels:
+    OBSERVED      = Tier 1 internal signals + historical external signals
+    STATIC        = Tier 2 industry + Tier 3 country identity + size/currency
+    KNOWN-FUTURE  = Tier 3 scheduled signals (holidays, rate-decision dates,
+                    quarter ends) + cyclical calendar features
+
+DECISION 3 — QUANTILE OUTPUT ALWAYS. NEVER A POINT ESTIMATE.
+  Three heads: P10 / P50 / P90. Band width communicates honest uncertainty and
+  widens automatically for low-data tenants.
+
+DECISION 4 — TENANT ISOLATION BY NAMESPACE.
+  Every store is namespaced by tenant_id. The model weights are shared; raw data,
+  features, and forecasts never cross a tenant boundary.
+
+DECISION 5 — HYBRID LSTM + ATTENTION. KEEP BOTH.
+  LSTM handles LOCAL (short-range sequential) structure. Interpretable
+  multi-head attention handles LONG-RANGE structure. Do not replace the LSTM
+  with pure attention — the local inductive bias matters on short org series.
+
+DECISION 6 — WEEKLY BUCKETS, 52-WEEK LOOKBACK, 13-WEEK HORIZON.
+  Weekly matches business planning cycles and the forecast horizon. Do NOT use
+  hourly or 15-minute bucketing — organisational signals do not resolve at that
+  scale and you would feed the model thousands of near-empty noisy steps.
+
+
+--------------------------------------------------------------------------------
+2. CORRECTIONS TO THE PRIOR CODE — APPLY ALL SEVEN
+--------------------------------------------------------------------------------
+The earlier draft of this model contains the following defects. Fix every one.
+
+FIX 1 — z_t MUST BE A PER-TIMESTEP SEQUENCE, NOT A POOLED VECTOR.
+  The encoder output is [B, T, d]. Do not mean-pool or flatten before fusion.
+  Static signals are BROADCAST across T at the fusion step.
+  Assert: `assert z.shape == (B, T, d)` after the encoder.
+
+FIX 2 — THE INDUSTRY MASK GATES THE ENCODER *INPUT*, NOT ITS OUTPUT.
+  Prior code applied m_ind after encoding. That is wrong — industry-irrelevant
+  features are already baked into z_t by then. Multiply the mask into the input
+  features BEFORE the LSTM. A finance tenant's encoder must never see
+  tech-specific signals.
+
+FIX 3 — GEOGRAPHY NEEDS TWO CHANNELS, NOT ONE.
+  Prior code had only a static e_geo vector. That captures "this is Kenya" but
+  not "Kenya's rate decision is next Tuesday". Add g_t — a time-varying
+  known-future channel carrying inflation path, rate-decision dates, FX
+  volatility, holidays, elections — concatenated into the encoder input.
+
+FIX 4 — ALL STORES NAMESPACED PER TENANT.
+  Every read and write goes through a namespace-scoped accessor. No shared
+  tables without a tenant_id filter enforced at the storage layer.
+
+FIX 5 — ADD THE INTERPRETABILITY HEAD.
+  The fusion engine emits TWO outputs: the fused representation AND the
+  variable/attention weights. Losing this loses the "why did the forecast move"
+  signal, which is a product differentiator.
+
+FIX 6 — NO FLATTEN HEAD.
+  Do not flatten [T, d] into one long vector for the output layer. It explodes
+  parameters, hard-locks seq_len, and destroys temporal structure. Use the last
+  timestep's hidden state: `h[:, -1, :]`.
+
+FIX 7 — STATIC ENCODER MUST INITIALISE THE LSTM HIDDEN STATE.
+  This is the mechanism by which industry and geography condition everything
+  downstream. The static covariate encoder produces FOUR context vectors:
+      c_h      -> LSTM initial hidden state
+      c_c      -> LSTM initial cell state
+      c_sel    -> conditions variable selection
+      c_enrich -> conditions attention enrichment
+  Without this wiring the three tiers are just extra input columns and the tier
+  architecture does nothing.
+
+
+--------------------------------------------------------------------------------
+3. FOLDER STRUCTURE — BUILD EXACTLY THIS
+--------------------------------------------------------------------------------
+
+m_learning/
+│
+├── README.md                      # quickstart, how to train, how to serve
+├── requirements.txt
+├── config.py                      # all hyperparameters + paths, single source
+│
+├── registry/
+│   ├── __init__.py
+│   ├── tiers.py                   # tier definitions, forecast target registry
+│   └── covariates.py              # static covariate schema + vocabularies
+│
+├── data/
+│   ├── __init__.py
+│   ├── event_loader.py            # pull raw events from Postgres per tenant
+│   ├── feature_builder.py         # events -> weekly grid, 5 feature families
+│   ├── text_features.py           # sentiment + topic drift from embeddings
+│   ├── external_signals.py        # country signal ingest + alignment
+│   ├── normalizer.py              # per-tenant log1p + z-score, train-only fit
+│   └── dataset.py                 # torch Dataset producing model tensors
+│
+├── models/
+│   ├── __init__.py
+│   ├── layers.py                  # GLU, GRN, VariableSelectionNetwork
+│   ├── static_encoder.py          # FIX 7 — the four context vectors
+│   ├── industry_mask.py           # Tier 2
+│   ├── geo_projector.py           # Tier 3 static half
+│   ├── encoder.py                 # Universal encoder: LSTM + attention
+│   ├── fusion.py                  # fusion engine + interpretability head
+│   ├── quantile_head.py           # P10/P50/P90
+│   └── tft.py                     # full model assembly
+│
+├── training/
+│   ├── __init__.py
+│   ├── losses.py                  # quantile (pinball) loss
+│   ├── rolling_window.py          # self-labelling window generator
+│   ├── trainer.py                 # train loop, validation, checkpointing
+│   └── train.py                   # CLI entrypoint
+│
+├── inference/
+│   ├── __init__.py
+│   ├── predictor.py               # load checkpoint, run forecast
+│   └── serve.py                   # namespace-scoped forecast API
+│
+├── storage/
+│   ├── __init__.py
+│   ├── feature_store.py           # namespaced feature read/write
+│   ├── forecast_store.py          # namespaced forecast persistence
+│   └── model_registry.py          # checkpoint versioning
+│
+├── scripts/
+│   ├── build_features.py          # batch feature build for all tenants
+│   ├── sync_external.py           # pull country signals on a schedule
+│   └── backfill.py                # historical feature backfill
+│
+└── tests/
+    ├── test_features.py
+    ├── test_normalization.py
+    ├── test_model_shapes.py       # assert every tensor boundary
+    └── test_tenant_isolation.py
+
+
+--------------------------------------------------------------------------------
+4. CONFIG — m_learning/config.py
+--------------------------------------------------------------------------------
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Config:
+    # --- temporal ---
+    BUCKET             : str = "W-MON"   # weekly, Monday start
+    ENCODER_LENGTH     : int = 52        # 1 year lookback
+    HORIZON            : int = 13        # 1 quarter forecast
+
+    # --- model dims ---
+    HIDDEN             : int = 64
+    ATTN_HEADS         : int = 4
+    DROPOUT            : float = 0.2
+    STATIC_EMB         : int = 16
+    GEO_LATENT         : int = 32
+
+    # --- quantiles ---
+    QUANTILES          : tuple = (0.1, 0.5, 0.9)
+
+    # --- training ---
+    BATCH_SIZE         : int = 64
+    LR                 : float = 1e-3
+    MAX_EPOCHS         : int = 100
+    PATIENCE           : int = 10
+    GRAD_CLIP          : float = 1.0
+
+    # --- cold start ---
+    MIN_WEEKS_REQUIRED : int = 12        # below this, flag low-confidence
+
+    # --- paths ---
+    CHECKPOINT_DIR     : str = "m_learning/checkpoints"
+    FEATURE_NAMESPACE  : str = "{tenant_id}:features"
+    FORECAST_NAMESPACE : str = "{tenant_id}:forecasts"
+
+CFG = Config()
+```
+
+
+--------------------------------------------------------------------------------
+5. FEATURE ENGINEERING — THE FIVE FAMILIES
+--------------------------------------------------------------------------------
+CORE PRINCIPLE: you never convert an individual event into a number. An event
+has a timestamp; a time series needs a value at every regular interval. The
+operation is: AGGREGATE EVENTS INTO A FIXED WEEKLY GRID and compute features
+per bucket.
+
+FAMILY 1 — COUNTS (raw volume)
+  n_commits, n_prs_opened, n_prs_merged, n_messages, n_docs_created,
+  n_docs_edited, n_tasks_assigned, n_tasks_completed, n_decisions
+
+FAMILY 2 — RATIOS (scale-free, often more predictive than counts)
+  after_hours_ratio   = events outside 09:00-18:00 / total
+  weekend_ratio       = weekend events / total
+  merge_rate          = prs_merged / prs_opened
+  completion_ratio    = tasks_completed / tasks_assigned
+  reopen_rate         = tasks_reopened / tasks_completed
+
+FAMILY 3 — LATENCIES (timestamps become features; strong burnout predictors)
+  median_review_delay   = PR opened -> first review
+  median_cycle_time     = task assigned -> completed
+  median_response_delay = message -> first reply in thread
+  oldest_open_task_age
+  weeks_since_last_decision
+
+FAMILY 4 — DISPERSION (how concentrated the work is)
+  actor_entropy    = -sum(p_i * log p_i) over each person's share of the week's
+                     events. LOW entropy = one person carrying everything =
+                     direct bus-factor and burnout signal.
+  top_actor_share  = share of events by the single largest contributor
+  n_active_actors  = distinct actors that week
+
+FAMILY 5 — TEXT-DERIVED (Slack / Notion content -> scalars)
+  sentiment_mean, sentiment_std  : small classifier over messages, weekly stats
+  topic_drift                    : cosine distance between this week's mean
+                                   embedding and a rolling 8-week baseline
+                                   centroid. Nearly free — reuse the embeddings
+                                   already in Qdrant. Directly powers the
+                                   topic-shift forecast.
+
+  DO NOT feed a raw 384-dim embedding as 384 separate variables. Variable
+  selection treats each variable independently — it becomes expensive and
+  uninterpretable. Reduce text to a handful of meaningful scalars.
+
+FEATURES THAT MUST NOT BE STATIC CATEGORICALS
+  author_id, repo_id, channel_id are NOT static covariates. Static means
+  constant across the whole series for that entity. The set of authors changes
+  every week. These are also high-cardinality and do not transfer across tenants
+  (repo 7 in tenant A means nothing in tenant B). Replace them with the
+  aggregate Family 4 features above.
+
+
+--------------------------------------------------------------------------------
+6. NORMALISATION — THE RULES THAT MAKE MULTI-TENANT WORK
+--------------------------------------------------------------------------------
+This section is where implementations most often fail. Follow it exactly.
+
+RULE 1 — NORMALISE PER TENANT, NOT GLOBALLY.
+  A 10-person startup makes 50 commits/week; a 500-person company makes 5,000.
+  With raw counts the global model spends its capacity learning company SIZE
+  instead of DYNAMICS, and cross-tenant learning stops working. Z-score each
+  feature against THAT TENANT'S OWN history.
+
+RULE 2 — LOG-TRANSFORM COUNTS BEFORE SCALING.
+  Event counts are heavy-tailed (one release week can be 10x normal).
+  Apply log1p(x) first, then z-score.
+
+RULE 3 — ENCODE CALENDAR TIME CYCLICALLY.
+  Week 52 and week 1 are adjacent but as integers they are maximally far apart.
+  Use sin(2*pi*w/52) and cos(2*pi*w/52) as a PAIR. Same for day-of-week/month.
+
+RULE 4 — CATEGORICALS GO TO EMBEDDINGS, NEVER RAW INTEGERS.
+  Feeding industry_id = 7 to a numeric channel implies industry 7 is "more than"
+  industry 3. Use nn.Embedding for every categorical.
+
+RULE 5 — MISSING BUCKETS ARE EXPLICIT, NEVER ZERO-FILLED SILENTLY.
+  Zero means "no activity". Missing means "not observed". These are different
+  facts and the model must be able to tell them apart. Emit:
+      observed              : binary mask channel, 1 if the week had any data
+      weeks_since_last_event: run-length of unobserved weeks
+  Do NOT carry-forward continuous states — it manufactures data and the model
+  learns staleness as signal.
+
+RULE 6 — FIT NORMALISATION STATS ON THE TRAINING WINDOW ONLY.
+  If z-score statistics include future weeks you have leaked the future into the
+  past. Backtests will look excellent and production forecasts will be garbage.
+
+
+--------------------------------------------------------------------------------
+7. REFERENCE IMPLEMENTATION — DATA LAYER
+--------------------------------------------------------------------------------
+
+FILE: m_learning/data/feature_builder.py
+```python
+import numpy as np
+import pandas as pd
+from m_learning.config import CFG
+
+COUNT_KINDS = {
+    "commit": "n_commits",
+    "pr_opened": "n_prs_opened",
+    "pr_merged": "n_prs_merged",
+    "message": "n_messages",
+    "doc_created": "n_docs_created",
+    "doc_edited": "n_docs_edited",
+    "task_assigned": "n_tasks_assigned",
+    "task_completed": "n_tasks_completed",
+    "decision": "n_decisions",
+}
+
+def _safe_div(a, b):
+    return float(a) / b if b else 0.0
+
+def build_weekly_features(events: pd.DataFrame, tenant_id: str) -> pd.DataFrame:
+    """
+    events: DataFrame with columns [ts (datetime64), actor (str),
+            kind (str), meta (dict)]
+    returns: one row per week on a COMPLETE weekly grid, with an `observed` mask.
+    """
+    ev = events.copy()
+    ev["ts"] = pd.to_datetime(ev["ts"], utc=True)
+    ev["week"] = ev["ts"].dt.to_period("W").dt.start_time
+    hour = ev["ts"].dt.hour
+    ev["after_hours"] = (hour < 9) | (hour >= 18)
+    ev["weekend"] = ev["ts"].dt.dayofweek >= 5
+
+    rows = []
+    for week, g in ev.groupby("week"):
+        n = len(g)
+        row = {"week": week, "observed": 1}
+
+        # --- Family 1: counts ---
+        for kind, col in COUNT_KINDS.items():
+            row[col] = int((g["kind"] == kind).sum())
+
+        # --- Family 2: ratios ---
+        row["after_hours_ratio"] = float(g["after_hours"].mean()) if n else 0.0
+        row["weekend_ratio"]     = float(g["weekend"].mean()) if n else 0.0
+        row["merge_rate"]        = _safe_div(row["n_prs_merged"],
+                                             row["n_prs_opened"])
+        row["completion_ratio"]  = _safe_div(row["n_tasks_completed"],
+                                             row["n_tasks_assigned"])
+
+        # --- Family 3: latencies (meta carries precomputed deltas in seconds) ---
+        row["median_review_delay"]   = _median_meta(g, "review_delay_s")
+        row["median_cycle_time"]     = _median_meta(g, "cycle_time_s")
+        row["median_response_delay"] = _median_meta(g, "response_delay_s")
+
+        # --- Family 4: dispersion ---
+        shares = g["actor"].value_counts(normalize=True).values
+        row["actor_entropy"]   = float(-(shares * np.log(shares + 1e-9)).sum())
+        row["top_actor_share"] = float(shares.max()) if len(shares) else 0.0
+        row["n_active_actors"] = int(g["actor"].nunique())
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows).set_index("week").sort_index()
+
+    # --- complete the grid so gaps become EXPLICIT (Rule 5) ---
+    full = pd.date_range(df.index.min(), df.index.max(), freq=CFG.BUCKET)
+    df = df.reindex(full)
+    df["observed"] = df["observed"].fillna(0).astype(int)
+
+    # run-length of consecutive unobserved weeks
+    gap = df["observed"].eq(0)
+    df["weeks_since_last_event"] = gap.groupby((~gap).cumsum()).cumsum()
+
+    df["tenant_id"] = tenant_id
+    return df
+
+def _median_meta(g: pd.DataFrame, key: str) -> float:
+    vals = [m.get(key) for m in g["meta"] if isinstance(m, dict) and key in m]
+    return float(np.median(vals)) if vals else 0.0
+```
+
+FILE: m_learning/data/text_features.py
+```python
+import numpy as np
+
+def weekly_text_features(week_embeddings: np.ndarray,
+                         baseline_centroid: np.ndarray | None,
+                         sentiments: list[float]) -> dict:
+    """
+    week_embeddings   : [n_messages, emb_dim] for this week (from Qdrant)
+    baseline_centroid : rolling 8-week mean centroid, or None on first weeks
+    sentiments        : per-message sentiment scores in [-1, 1]
+    """
+    out = {"sentiment_mean": 0.0, "sentiment_std": 0.0, "topic_drift": 0.0}
+    if sentiments:
+        out["sentiment_mean"] = float(np.mean(sentiments))
+        out["sentiment_std"]  = float(np.std(sentiments))
+    if week_embeddings is not None and len(week_embeddings) and \
+       baseline_centroid is not None:
+        c = week_embeddings.mean(axis=0)
+        c = c / (np.linalg.norm(c) + 1e-9)
+        b = baseline_centroid / (np.linalg.norm(baseline_centroid) + 1e-9)
+        out["topic_drift"] = float(1.0 - np.dot(c, b))   # cosine distance
+    return out
+
+def update_baseline(prev_centroid, week_centroid, window: int = 8):
+    if prev_centroid is None:
+        return week_centroid
+    alpha = 1.0 / window
+    return (1 - alpha) * prev_centroid + alpha * week_centroid
+```
+
+FILE: m_learning/data/normalizer.py
+```python
+import numpy as np
+import pandas as pd
+
+COUNT_COLS = ["n_commits", "n_prs_opened", "n_prs_merged", "n_messages",
+              "n_docs_created", "n_docs_edited", "n_tasks_assigned",
+              "n_tasks_completed", "n_decisions", "n_active_actors"]
+
+PASSTHROUGH = {"observed", "tenant_id"}
+
+class TenantNormalizer:
+    """Per-tenant. Fit on the TRAINING WINDOW ONLY (Rule 6)."""
+
+    def __init__(self):
+        self.stats: dict[str, tuple[float, float]] = {}
+
+    def fit(self, df: pd.DataFrame, train_end):
+        train = df.loc[:train_end].copy()
+        for c in COUNT_COLS:
+            if c in train:
+                train[c] = np.log1p(train[c].fillna(0))
+        for c in train.select_dtypes("number").columns:
+            if c in PASSTHROUGH:
+                continue
+            self.stats[c] = (float(train[c].mean()), float(train[c].std()))
+        return self
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        for c in COUNT_COLS:
+            if c in out:
+                out[c] = np.log1p(out[c].fillna(0))
+        for c, (mu, sd) in self.stats.items():
+            if c in out:
+                out[c] = (out[c] - mu) / (sd + 1e-6)
+
+        # cyclical calendar (Rule 3)
+        w = pd.DatetimeIndex(out.index).isocalendar().week.values.astype(float)
+        out["week_sin"] = np.sin(2 * np.pi * w / 52.0)
+        out["week_cos"] = np.cos(2 * np.pi * w / 52.0)
+
+        num = out.select_dtypes("number").columns
+        out[num] = out[num].fillna(0.0)
+        return out
+```
+
+
+--------------------------------------------------------------------------------
+8. REFERENCE IMPLEMENTATION — MODEL LAYER
+--------------------------------------------------------------------------------
+
+FILE: m_learning/models/layers.py
+```python
+import torch
+import torch.nn as nn
+
+class GLU(nn.Module):
+    """Gated Linear Unit — lets the network suppress components toward zero."""
+    def __init__(self, d_in, d_out):
+        super().__init__()
+        self.fc = nn.Linear(d_in, d_out)
+        self.gate = nn.Linear(d_in, d_out)
+
+    def forward(self, x):
+        return torch.sigmoid(self.gate(x)) * self.fc(x)
+
+
+class GRN(nn.Module):
+    """
+    Gated Residual Network.
+    GRN(a) = LayerNorm(a + GLU(W3 * ELU(W4*a + W5*c + b4) + b3))
+    Optional context c conditions the transform (used by static enrichment).
+    """
+    def __init__(self, d_in, d_hidden, d_out, dropout=0.1, d_context=None):
+        super().__init__()
+        self.skip = nn.Linear(d_in, d_out) if d_in != d_out else nn.Identity()
+        self.fc1 = nn.Linear(d_in, d_hidden)
+        self.ctx = nn.Linear(d_context, d_hidden, bias=False) if d_context else None
+        self.elu = nn.ELU()
+        self.fc2 = nn.Linear(d_hidden, d_hidden)
+        self.drop = nn.Dropout(dropout)
+        self.glu = GLU(d_hidden, d_out)
+        self.norm = nn.LayerNorm(d_out)
+
+    def forward(self, a, c=None):
+        h = self.fc1(a)
+        if self.ctx is not None and c is not None:
+            if c.dim() == 2 and h.dim() == 3:
+                c = c.unsqueeze(1).expand(-1, h.size(1), -1)
+            h = h + self.ctx(c)
+        h = self.fc2(self.elu(h))
+        h = self.drop(h)
+        return self.norm(self.skip(a) + self.glu(h))
+
+
+class VariableSelectionNetwork(nn.Module):
+    """
+    Learns which input variables matter, per timestep, conditioned on static ctx.
+    Returns the weighted combination AND the selection weights (interpretability).
+    """
+    def __init__(self, n_vars, d_hidden, dropout=0.1, d_context=None):
+        super().__init__()
+        self.n_vars = n_vars
+        self.flat_grn = GRN(n_vars * d_hidden, d_hidden, n_vars,
+                            dropout, d_context)
+        self.var_grns = nn.ModuleList(
+            [GRN(d_hidden, d_hidden, d_hidden, dropout) for _ in range(n_vars)]
+        )
+
+    def forward(self, x, context=None):
+        # x: [B, T, n_vars, d_hidden]
+        B, T, V, D = x.shape
+        flat = x.reshape(B, T, V * D)
+        weights = torch.softmax(self.flat_grn(flat, context), dim=-1)  # [B,T,V]
+        processed = torch.stack(
+            [self.var_grns[i](x[:, :, i, :]) for i in range(V)], dim=2
+        )                                                              # [B,T,V,D]
+        combined = (processed * weights.unsqueeze(-1)).sum(dim=2)       # [B,T,D]
+        return combined, weights
+```
+
+FILE: m_learning/models/static_encoder.py  (FIX 7)
+```python
+import torch
+import torch.nn as nn
+from m_learning.models.layers import GRN
+
+class StaticCovariateEncoder(nn.Module):
+    """
+    Turns {industry, country, size_band, currency} into FOUR context vectors.
+    This is the mechanism that conditions the whole model on tenant identity.
+    """
+    def __init__(self, vocab_sizes: dict, emb_dim: int, d_hidden: int,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.embeds = nn.ModuleDict({
+            k: nn.Embedding(v, emb_dim) for k, v in vocab_sizes.items()
+        })
+        d_in = emb_dim * len(vocab_sizes)
+        self.grn_h      = GRN(d_in, d_hidden, d_hidden, dropout)  # LSTM h0
+        self.grn_c      = GRN(d_in, d_hidden, d_hidden, dropout)  # LSTM c0
+        self.grn_sel    = GRN(d_in, d_hidden, d_hidden, dropout)  # var selection
+        self.grn_enrich = GRN(d_in, d_hidden, d_hidden, dropout)  # attn enrich
+
+    def forward(self, static_ids: dict):
+        parts = [self.embeds[k](static_ids[k]) for k in self.embeds]
+        s = torch.cat(parts, dim=-1)                              # [B, d_in]
+        return (self.grn_h(s), self.grn_c(s),
+                self.grn_sel(s), self.grn_enrich(s))
+```
+
+FILE: m_learning/models/industry_mask.py  (Tier 2)
+```python
+import torch
+import torch.nn as nn
+
+class IndustryMask(nn.Module):
+    """
+    Tier 2. Produces a SOFT feature mask in [0,1] from the industry ID.
+    Applied to the ENCODER INPUT (FIX 2), never to its output.
+    """
+    def __init__(self, n_industries: int, n_features: int, emb_dim: int = 16):
+        super().__init__()
+        self.embed = nn.Embedding(n_industries, emb_dim)
+        self.proj  = nn.Linear(emb_dim, n_features)
+
+    def forward(self, industry_id):          # [B]
+        return torch.sigmoid(self.proj(self.embed(industry_id)))  # [B, n_feat]
+```
+
+FILE: m_learning/models/geo_projector.py  (Tier 3 static half)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class GeoProjector(nn.Module):
+    """
+    Tier 3 static half. L2-normalised so no country dominates by magnitude —
+    only its learned direction carries information.
+    NOTE: the time-varying half (g_t) is NOT here — it is concatenated into the
+    encoder input as a known-future channel (FIX 3).
+    """
+    def __init__(self, n_regions: int, latent: int = 32, emb_dim: int = 16):
+        super().__init__()
+        self.embed = nn.Embedding(n_regions, emb_dim)
+        self.proj  = nn.Linear(emb_dim, latent)
+
+    def forward(self, geo_code):             # [B]
+        return F.normalize(self.proj(self.embed(geo_code)), dim=-1)  # [B, latent]
+```
+
+FILE: m_learning/models/encoder.py  (Tier 1 — FIX 1, FIX 2, FIX 5, FIX 7)
+```python
+import torch
+import torch.nn as nn
+from m_learning.models.layers import GRN, VariableSelectionNetwork
+
+class UniversalEncoder(nn.Module):
+    """
+    Tier 1. LSTM for LOCAL structure, interpretable attention for LONG-RANGE.
+    Output z is a PER-TIMESTEP SEQUENCE [B, T, d] (FIX 1).
+    """
+    def __init__(self, n_features, d_hidden, n_heads=4, dropout=0.2):
+        super().__init__()
+        self.n_features = n_features
+        self.var_embed = nn.Linear(1, d_hidden)
+        self.vsn = VariableSelectionNetwork(n_features, d_hidden, dropout,
+                                            d_context=d_hidden)
+        self.lstm = nn.LSTM(d_hidden, d_hidden, batch_first=True)
+        self.gate_norm = nn.LayerNorm(d_hidden)
+        self.enrich = GRN(d_hidden, d_hidden, d_hidden, dropout,
+                          d_context=d_hidden)
+        self.attn = nn.MultiheadAttention(d_hidden, n_heads,
+                                          dropout=dropout, batch_first=True)
+        self.post_norm = nn.LayerNorm(d_hidden)
+
+    def forward(self, x, m_ind, c_h, c_c, c_sel, c_enrich):
+        """
+        x       : [B, T, F]  observed + known-future features (g_t already concat)
+        m_ind   : [B, F]     industry mask
+        c_*     : [B, d]     static context vectors
+        returns : z [B,T,d], var_weights [B,T,F], attn_weights [B,T,T]
+        """
+        B, T, F = x.shape
+        assert F == self.n_features, f"expected {self.n_features} features, got {F}"
+
+        # FIX 2 — gate the INPUT
+        x = x * m_ind.unsqueeze(1)                       # [B, T, F]
+
+        v = self.var_embed(x.unsqueeze(-1))              # [B, T, F, d]
+        sel, var_w = self.vsn(v, c_sel)                  # [B,T,d], [B,T,F]
+
+        h0 = c_h.unsqueeze(0).contiguous()
+        c0 = c_c.unsqueeze(0).contiguous()
+        lstm_out, _ = self.lstm(sel, (h0, c0))           # FIX 7
+        z = self.gate_norm(lstm_out + sel)               # residual + norm
+
+        z = self.enrich(z, c_enrich)                     # static enrichment
+        attn_out, attn_w = self.attn(z, z, z, need_weights=True)
+        z = self.post_norm(z + attn_out)                 # residual THEN norm
+
+        assert z.shape == (B, T, z.size(-1))             # FIX 1
+        return z, var_w, attn_w
+```
+
+FILE: m_learning/models/fusion.py  (FIX 5)
+```python
+import torch
+import torch.nn as nn
+
+class FusionEngine(nn.Module):
+    """
+    Broadcasts static signals across every timestep and fuses.
+    Emits TWO outputs: the fused representation AND interpretability weights.
+    """
+    def __init__(self, d_hidden, geo_dim, static_dim, dropout=0.2):
+        super().__init__()
+        self.ff = nn.Linear(d_hidden + geo_dim + static_dim, d_hidden)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(d_hidden)
+        self.interp = nn.Linear(d_hidden, d_hidden)
+
+    def forward(self, z, e_geo, c_static):
+        """
+        z        : [B, T, d]
+        e_geo    : [B, geo_dim]
+        c_static : [B, static_dim]
+        returns  : h [B,T,d], alpha [B,T,d]
+        """
+        T = z.size(1)
+        eg = e_geo.unsqueeze(1).expand(-1, T, -1)
+        cs = c_static.unsqueeze(1).expand(-1, T, -1)
+        h = self.drop(self.act(self.ff(torch.cat([z, eg, cs], dim=-1))))
+        h = self.norm(z + h)
+        alpha = torch.softmax(self.interp(h), dim=-1)
+        return h, alpha
+```
+
+FILE: m_learning/models/quantile_head.py  (FIX 6)
+```python
+import torch
+import torch.nn as nn
+
+class QuantileHead(nn.Module):
+    """One linear head per quantile. Uses the LAST timestep — never Flatten."""
+    def __init__(self, d_hidden, horizon, quantiles=(0.1, 0.5, 0.9)):
+        super().__init__()
+        self.quantiles = tuple(quantiles)
+        self.heads = nn.ModuleList(
+            [nn.Linear(d_hidden, horizon) for _ in self.quantiles]
+        )
+
+    def forward(self, h):                      # h: [B, T, d]
+        last = h[:, -1, :]                     # FIX 6
+        return {q: head(last) for q, head in zip(self.quantiles, self.heads)}
+```
+
+FILE: m_learning/models/tft.py  (assembly)
+```python
+import torch
+import torch.nn as nn
+from m_learning.config import CFG
+from m_learning.models.static_encoder import StaticCovariateEncoder
+from m_learning.models.industry_mask import IndustryMask
+from m_learning.models.geo_projector import GeoProjector
+from m_learning.models.encoder import UniversalEncoder
+from m_learning.models.fusion import FusionEngine
+from m_learning.models.quantile_head import QuantileHead
+
+class CoBrainTFT(nn.Module):
+    def __init__(self, n_features, vocab_sizes, cfg=CFG):
+        super().__init__()
+        self.static_enc = StaticCovariateEncoder(
+            vocab_sizes, cfg.STATIC_EMB, cfg.HIDDEN, cfg.DROPOUT)
+        self.industry_mask = IndustryMask(
+            vocab_sizes["industry"], n_features, cfg.STATIC_EMB)
+        self.geo = GeoProjector(
+            vocab_sizes["country"], cfg.GEO_LATENT, cfg.STATIC_EMB)
+        self.encoder = UniversalEncoder(
+            n_features, cfg.HIDDEN, cfg.ATTN_HEADS, cfg.DROPOUT)
+        self.fusion = FusionEngine(
+            cfg.HIDDEN, cfg.GEO_LATENT, cfg.HIDDEN, cfg.DROPOUT)
+        self.head = QuantileHead(cfg.HIDDEN, cfg.HORIZON, cfg.QUANTILES)
+
+    def forward(self, batch):
+        """
+        batch:
+          x          [B, T, F]  observed + known-future (g_t already concatenated)
+          static_ids dict of [B] long tensors: industry, country, size_band,
+                     currency
+        returns dict with quantile predictions and interpretability weights.
+        """
+        x = batch["x"]
+        sid = batch["static_ids"]
+
+        c_h, c_c, c_sel, c_enrich = self.static_enc(sid)
+        m_ind = self.industry_mask(sid["industry"])
+        e_geo = self.geo(sid["country"])
+
+        z, var_w, attn_w = self.encoder(x, m_ind, c_h, c_c, c_sel, c_enrich)
+        h, alpha = self.fusion(z, e_geo, c_enrich)
+        preds = self.head(h)
+
+        return {
+            "quantiles": preds,          # {q: [B, horizon]}
+            "var_weights": var_w,        # [B, T, F]
+            "attn_weights": attn_w,      # [B, T, T]
+            "fusion_weights": alpha,     # [B, T, d]
+        }
+```
+
+
+--------------------------------------------------------------------------------
+9. TRAINING
+--------------------------------------------------------------------------------
+
+FILE: m_learning/training/losses.py
+```python
+import torch
+
+def quantile_loss(preds: dict, target: torch.Tensor) -> torch.Tensor:
+    """
+    Pinball loss.  QL(y, yhat, q) = q*max(y-yhat,0) + (1-q)*max(yhat-y,0)
+    For q=0.9, under-prediction is penalised 9x more than over-prediction,
+    which pushes P90 upward until it genuinely covers the high tail.
+    preds : {q: [B, H]}   target : [B, H]
+    """
+    total = 0.0
+    for q, yhat in preds.items():
+        err = target - yhat
+        total = total + torch.max(q * err, (q - 1.0) * err).mean()
+    return total
+```
+
+FILE: m_learning/training/rolling_window.py  (self-labelling)
+```python
+import numpy as np
+
+def make_windows(arr: np.ndarray, encoder_len: int, horizon: int):
+    """
+    arr: [T_total, F] normalised feature matrix for ONE tenant.
+    Yields (x_window, y_window) pairs. The future values ARE the labels —
+    this is why the system self-improves as time passes: every elapsed week
+    turns a prediction into a labelled training example.
+    """
+    T = arr.shape[0]
+    last_start = T - (encoder_len + horizon)
+    for s in range(0, max(last_start + 1, 0)):
+        x = arr[s : s + encoder_len]
+        y = arr[s + encoder_len : s + encoder_len + horizon]
+        yield x, y
+```
+
+FILE: m_learning/training/trainer.py — SPEC
+  - AdamW optimiser, lr from CFG.LR, gradient clipping at CFG.GRAD_CLIP.
+  - ReduceLROnPlateau on validation loss.
+  - Early stopping with CFG.PATIENCE.
+  - Validation split is TEMPORAL, never random: the last N weeks are held out.
+    Random splits leak the future and invalidate the whole evaluation.
+  - Checkpoint best model to CFG.CHECKPOINT_DIR via storage/model_registry.py.
+  - Log per-quantile loss separately so you can see if P10/P90 are calibrated.
+  - Batch mixes MANY tenants — this is what produces cross-tenant learning.
+
+
+--------------------------------------------------------------------------------
+10. TENANT ISOLATION AND COLD-START
+--------------------------------------------------------------------------------
+
+TENANT ISOLATION
+  Layer               Mechanism
+  ------------------  ----------------------------------------------------
+  Feature store       tenant_id namespace prefix on every record
+  Forecast store      namespace-scoped queries, RBAC enforced at the API
+  Sequence cache      per-tenant, encrypted at rest
+  Model weights       SHARED — learns patterns, never memorises raw data
+  Serving API         caller's tenant_id must match the requested namespace
+
+  Implement a single accessor in storage/feature_store.py that REQUIRES a
+  tenant_id argument. No code path may query without it. tests/
+  test_tenant_isolation.py must assert that a cross-tenant read raises.
+
+COLD-START (new tenant, little or no history)
+  1. Lean on static priors — with a thin sequence the fusion engine weights
+     industry and geography more heavily. The model forecasts "what a typical
+     finance company in Kenya looks like" until real data refines it.
+  2. Bands widen automatically — the quantile loss learns wider P10/P90 spreads
+     where errors are larger, so uncertainty is communicated honestly.
+  3. Fleet warm start — because the model is global, a new tenant inherits
+     everything learned from similar tenants from day one.
+  4. Flag it — if observed weeks < CFG.MIN_WEEKS_REQUIRED, tag the forecast
+     `low_confidence: true` so the UI can label it.
+
+  This is a product advantage: a single-company tool is useless on day one.
+
+
+--------------------------------------------------------------------------------
+11. TRAINING DATA SOURCES
+--------------------------------------------------------------------------------
+
+INTERNAL (Tier 1) — you generate this from your own pipeline
+  Every connector already produces the events. Aggregate per Section 5.
+  Signal              Derived from
+  ------------------  ------------------------------------------
+  comms volume        Gmail, Slack connectors
+  after-hours ratio   message timestamps
+  sentiment           message text, small classifier
+  task throughput     GitHub, Jira
+  doc creation rate   Notion, Drive
+  decision frequency  Brain decisions log
+  topic drift         Qdrant embeddings already in the pipeline
+
+EXTERNAL (Tier 3) — public, free, downloadable time-series
+  Signal                Source                    Access
+  --------------------  ------------------------  ---------------------------
+  Inflation / CPI       World Bank Open Data      data.worldbank.org
+  Interest rates        BIS / central banks       bis.org
+  GDP growth            World Bank, IMF           imf.org/data
+  FX rates/volatility   ECB, exchangerate.host    free APIs
+  Employment            ILO                       ilostat.ilo.org
+  Political stability   World Bank WGI            info.worldbank.org/governance/wgi
+  Holidays / calendars  Nager.Date                date.nager.at
+  Macro series          FRED                      fred.stlouisfed.org
+
+PROXY DATASETS for pretraining before tenant data exists
+  M4 / M5 Competition    github.com/Mcompetitions   general forecasting
+  GitHub Archive         gharchive.org              real dev-activity series
+  Enron corpus           cs.cmu.edu/~enron          org communication patterns
+  UCI ML Repository      archive.ics.uci.edu        multivariate sequences
+
+LABELS
+  Rolling-window self-labelling (training/rolling_window.py). Train on weeks
+  1-52, predict 53-65; once those weeks arrive their actual values are the
+  labels. The system improves automatically as time passes.
+
+
+--------------------------------------------------------------------------------
+12. BUILD ORDER — FOLLOW THIS SEQUENCE
+--------------------------------------------------------------------------------
+   1. config.py + requirements.txt + README.md
+   2. registry/covariates.py, registry/tiers.py  (schemas first)
+   3. storage/feature_store.py                    (namespaced accessor)
+   4. data/event_loader.py                        (pull from Postgres)
+   5. data/feature_builder.py                     (Section 7 code)
+   6. data/text_features.py                       (Section 7 code)
+   7. data/normalizer.py                          (Section 7 code)
+   8. tests/test_features.py + test_normalization.py — MUST PASS before step 9
+   9. models/layers.py                            (GLU, GRN, VSN)
+  10. models/static_encoder.py                    (FIX 7)
+  11. models/industry_mask.py, models/geo_projector.py
+  12. models/encoder.py                           (FIX 1, 2)
+  13. models/fusion.py                            (FIX 5)
+  14. models/quantile_head.py                     (FIX 6)
+  15. models/tft.py                               (assembly)
+  16. tests/test_model_shapes.py — assert EVERY tensor boundary
+  17. training/losses.py, rolling_window.py, trainer.py, train.py
+  18. data/external_signals.py + scripts/sync_external.py   (Tier 3)
+  19. inference/predictor.py, storage/forecast_store.py
+  20. inference/serve.py + tests/test_tenant_isolation.py
+  21. scripts/build_features.py, scripts/backfill.py
+
+
+--------------------------------------------------------------------------------
+13. NON-NEGOTIABLE RULES — SUMMARY
+--------------------------------------------------------------------------------
+  - ONE global model conditioned by static covariates. Never one model per tenant.
+  - z_t is a per-timestep SEQUENCE [B,T,d]. Never pool or flatten before fusion.
+  - The industry mask gates the encoder INPUT. Never its output.
+  - Geography has TWO channels: static e_geo AND time-varying g_t.
+  - The static encoder initialises the LSTM hidden state. Without this the tiers
+    are meaningless.
+  - The fusion engine emits interpretability weights as a second output.
+  - The output head uses the LAST timestep. Never Flatten.
+  - Weekly buckets. 52-week lookback. 13-week horizon.
+  - Missing weeks are an explicit `observed` mask + `weeks_since_last_event`.
+    Never silent zero-fill. Never carry-forward.
+  - Normalise PER TENANT: log1p on counts, then z-score on that tenant's own
+    history, with statistics fitted on the TRAINING WINDOW ONLY.
+  - Calendar time is encoded cyclically (sin/cos pairs). Never as raw integers.
+  - Categoricals go to nn.Embedding. Never raw integer IDs into numeric channels.
+  - author_id / repo_id / channel_id are NOT static covariates. Use aggregate
+    dispersion features instead.
+  - Text becomes a handful of scalars (sentiment, topic drift). Never 384 raw
+    embedding dims as 384 variables.
+  - Validation split is TEMPORAL. Never random.
+  - Quantile output always: P10 / P50 / P90. Never a point estimate.
+  - Every store access requires a tenant_id. No exceptions.
+
+================================================================================
+END OF IMPLEMENTATION SPECIFICATION
+================================================================================

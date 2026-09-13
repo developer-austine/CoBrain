@@ -1,0 +1,28 @@
+psycopg2-binary>=2.9.0
+python-dotenv>=1.0.0
+chardet>=5.2.0
+numpy>=1.26.0
+python-dateutil>=2.9.0
+
+# Normaliser
+chardet
+python-dateutil
+numpy
+
+# PII
+spacy
+presidio-analyzer
+presidio-anonymizer
+
+# Chunker + Embedder
+sentence-transformers
+qdrant-client
+
+# Pipeline
+celery
+redis
+fastapi
+uvicorn
+sqlalchemy
+alembic
+psycopg2-binary

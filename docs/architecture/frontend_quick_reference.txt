@@ -1,0 +1,394 @@
+================================================================================
+COMPANY BRAIN — FRONTEND QUICK REFERENCE
+================================================================================
+1-page guide for frontend developers. Print or bookmark this.
+================================================================================
+
+
+KEY LAYERS
+──────────────────────────────────────────────────────────────────────────────
+1. PAGES (app/)         → URL routing, data fetching, layout composition
+2. COMPONENTS (_comp/)  → Reusable UI, state, interactivity
+3. LOGIC (lib/, types/) → Types, utilities, business logic
+4. ACTIONS (actions/)   → Server actions for mutations
+
+
+DATA FLOW (The Core Loop)
+──────────────────────────────────────────────────────────────────────────────
+User Action (click button)
+    ↓
+Client Component calls Server Action
+    ↓
+Server Action queries/mutates Prisma + calls API route
+    ↓
+Postgres/Redis/Qdrant updated
+    ↓
+Page revalidated (revalidatePath)
+    ↓
+Page re-renders with new data
+    ↓
+UI updates immediately
+
+
+ROUTING TREE (The Important Routes)
+──────────────────────────────────────────────────────────────────────────────
+/                                  Home (workflow list, monitor, search)
+/connectors                        Workflow list page
+/connectors/editor                 Create new workflow
+/connectors/[workflowId]           MAIN EDITOR (drag-drop canvas)
+/connectors/runs/[wId]/[eId]      Execution detail (monitoring)
+/activity/chat                     Search/chat interface
+/activity/chatlogs                Chat history
+/sign-in                          Clerk auth
+/sign-up                          Clerk auth
+
+
+KEY FILES & LOCATIONS
+──────────────────────────────────────────────────────────────────────────────
+page.tsx                           Route handler (async, Server Component)
+layout.tsx                         Layout wrapper (ClerkProvider, nav)
+_components/                       Private components (specific to this route)
+app/api/[endpoint]/route.ts       API endpoints (OAuth, sync, search)
+actions/workflows/[action].ts     Server actions (create, save, run)
+lib/                              Utilities, types, Prisma
+types/                            TypeScript definitions
+components/                       Shared UI components (shadcn/ui)
+
+
+COMMON PATTERNS
+──────────────────────────────────────────────────────────────────────────────
+
+Creating a Workflow:
+  User clicks "New Workflow"
+    ↓ <CreateWorkflowDialog />
+    ↓ Form submission → POST /api/workflows OR Server Action
+    ↓ Insert Workflow row in Prisma
+    ↓ Redirect to /connectors/{workflowId}
+
+Saving Workflow Definition:
+  User clicks "Save"
+    ↓ <SaveBtn /> calls saveWorkflow(workflowId, flowDef)
+    ↓ Server Action updates Workflow.definition
+    ↓ revalidatePath() invalidates cache
+    ↓ Toast: "Workflow saved ✓"
+
+Syncing Data:
+  User clicks "Sync" on Gmail node
+    ↓ <GmailConnectButton /> calls POST /api/gmail/sync
+    ↓ Route handler: fetch Gmail API, UPSERT Email rows, LPUSH Redis
+    ↓ Return { synced: X, queued: Y }
+    ↓ Toast: "Synced X emails"
+
+Running Workflow:
+  User clicks "Run"
+    ↓ <RunBtn /> calls runWorkflow(workflowId)
+    ↓ Server Action: create WorkflowExecution, queue all documents
+    ↓ Redirect to /connectors/runs/{wId}/{eId}
+    ↓ <PipelineMonitor /> polls status every 2 seconds
+    ↓ Shows: PENDING → QUEUED → PROCESSED
+
+Searching:
+  User enters query
+    ↓ <SearchResults /> POST /api/search
+    ↓ Next.js route calls Python backend
+    ↓ Python embeds query, searches Qdrant
+    ↓ Returns [ { text, source, score }, ... ]
+    ↓ Display results with badges
+
+
+AUTHENTICATION & AUTHORIZATION
+──────────────────────────────────────────────────────────────────────────────
+Clerk handles login/session
+  ├─ ClerkProvider in root layout
+  ├─ middleware.ts checks auth before dashboard
+  └─ auth() function returns { userId } in server code
+
+Multi-tenant check:
+  const { userId } = await auth()
+  const workflow = await prisma.workflow.findUnique({
+    where: { id: workflowId, userId }  // ← Prevents cross-user access
+  })
+
+
+COMPONENT PATTERNS
+──────────────────────────────────────────────────────────────────────────────
+
+Button → Server Action:
+  <form action={createWorkflow}>
+    <input name="name" />
+    <button type="submit">Create</button>
+  </form>
+
+Polling (Status Updates):
+  const { data: status } = useQuery({
+    queryKey: ['document', docId, 'status'],
+    queryFn: () => fetch(`/api/document/${docId}/status`).then(r => r.json()),
+    refetchInterval: 2000  // 2 second polling
+  })
+
+OAuth Flow:
+  User clicks <GmailConnectButton />
+    → Redirect to /api/gmail/auth
+    → Google OAuth → /api/gmail/callback
+    → Insert GmailConnection
+    → Redirect back to editor
+
+
+API RESPONSE PATTERNS
+──────────────────────────────────────────────────────────────────────────────
+
+Success:
+  { success: true, data: {...} }
+  HTTP 200
+
+Error:
+  { error: "User-friendly message" }
+  HTTP 400/401/403/404/500
+
+Status Tracking:
+  { id, source, status, errorMessage?, processedAt? }
+
+Sync Response:
+  { synced: int, queued: int, skipped: int, message: string }
+
+Search Results:
+  { results: [ { text, source, author, score }, ... ] }
+
+
+DATABASE QUERIES
+──────────────────────────────────────────────────────────────────────────────
+Always import Prisma from lib/prisma.ts (singleton):
+  import prisma from "@/lib/prisma"
+
+Always filter by userId:
+  WHERE { id: workflowId, userId }
+
+Don't N+1:
+  Use include/select to fetch related data
+  prisma.workflow.findUnique({
+    where: { id, userId },
+    include: { workflowExecutions: true }
+  })
+
+Transactions:
+  prisma.$transaction([ op1, op2, op3 ])
+
+
+ENVIRONMENT VARIABLES
+──────────────────────────────────────────────────────────────────────────────
+.env.local (local development):
+  DATABASE_URL=postgresql://...
+  REDIS_URL=redis://localhost:6379
+  QDRANT_URL=http://localhost:6333
+  PYTHON_BACKEND_URL=http://localhost:8000
+  GOOGLE_CLIENT_ID=...
+  GOOGLE_CLIENT_SECRET=...
+  NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=...
+  CLERK_SECRET_KEY=...
+
+Production (.env):
+  Point to production Postgres, Redis, Qdrant
+  Use Vercel environment variables
+
+
+NEXT.JS SPECIFICS
+──────────────────────────────────────────────────────────────────────────────
+"use client" = Client Component (use hooks, setState)
+"use server" = Server Action (mutations, DB access)
+
+No directive = Server Component (default)
+  Can: async, Prisma queries, secrets
+  Cannot: hooks, event handlers
+
+revalidatePath("/path") = Invalidate cache for this route
+revalidateTag("tag-name") = Invalidate by tag (fine-grained)
+generateStaticParams() = Generate static routes at build time
+
+
+STYLING
+──────────────────────────────────────────────────────────────────────────────
+Tailwind CSS only (no inline styles, no CSS modules in app/)
+  className="flex items-center justify-between gap-2"
+
+Responsive:
+  className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3"
+
+Use shadcn/ui for primitives:
+  <Button />, <Card />, <Input />, <Dialog />, etc.
+
+No hardcoded colors:
+  ✓ bg-blue-600 (Tailwind)
+  ✗ bg-#0066FF (hardcoded)
+
+
+TESTING
+──────────────────────────────────────────────────────────────────────────────
+Unit test pure functions:
+  executionPlan.ts (converts flow to phases)
+
+Integration test API routes:
+  mock Prisma, test sync/search endpoints
+
+E2E test full workflows:
+  Create workflow → Sync → Monitor → Search
+
+
+DEBUGGING COMMANDS
+──────────────────────────────────────────────────────────────────────────────
+# Start dev server
+pnpm dev
+
+# Type check
+pnpm tsc --noEmit
+
+# Lint
+pnpm lint
+
+# Build
+pnpm build
+
+# Start production build
+pnpm start
+
+# Database queries
+docker-compose exec postgres psql -U company_brain -d company_brain
+
+# Check Redis
+redis-cli
+
+# Check Qdrant
+curl http://localhost:6333/collections/company_brain
+
+
+COMMON ISSUES
+──────────────────────────────────────────────────────────────────────────────
+
+"TypeError: Cannot read property 'userId' of undefined"
+  ↳ Missing: const { userId } = await auth()
+  ↳ Fix: Add auth check to server component/action
+
+"Prisma client not found"
+  ↳ Wrong: import { PrismaClient } from "@prisma/client"
+  ↳ Right: import prisma from "@/lib/prisma"
+
+"Styles not applying"
+  ↳ Check: Is className spelled correctly?
+  ↳ Check: Is Tailwind config correct? (tailwind.config.ts)
+
+"OAuth callback fails"
+  ↳ Check: GOOGLE_CLIENT_ID/SECRET in .env.local
+  ↳ Check: Callback URL registered in Google Cloud Console
+  ↳ Check: Redirect URL in app/api/gmail/callback matches config
+
+"Can't access other users' data"
+  ↳ Expected: { userId } filter prevents this
+  ↳ This is correct behavior (multi-tenant)
+
+
+FILE NAME CONVENTIONS
+──────────────────────────────────────────────────────────────────────────────
+✓ Components: PascalCase (FlowEditor.tsx, NodeCard.tsx)
+✓ Functions: camelCase (fetchWorkflows, saveWorkflow)
+✓ Routes: kebab-case (app/api/gmail/auth/route.ts)
+✓ Routes params: camelCase in brackets ([workflowId])
+✓ Constants: UPPER_SNAKE_CASE (DEFAULT_CHUNK_SIZE)
+✓ Styles: kebab-case classes (node-header, flow-canvas)
+
+
+IMPORT PATHS
+──────────────────────────────────────────────────────────────────────────────
+@/        = src root (app/, lib/, components/, etc.)
+@/lib/    = utilities and helpers
+@/types/  = TypeScript definitions
+@/actions/ = server actions
+@/components/ = shared UI components
+
+
+GIT WORKFLOW
+──────────────────────────────────────────────────────────────────────────────
+Commit message format:
+  [feature] Short description of what changed
+  [fix] Bug fix description
+  [docs] Documentation update
+  [refactor] Code structure improvement
+
+Example:
+  [feature] Add PipelineMonitor component for real-time status tracking
+  [fix] Fix OAuth callback URL mismatch
+  [refactor] Extract node component logic to custom hook
+
+
+PERFORMANCE CHECKLIST
+──────────────────────────────────────────────────────────────────────────────
+□ Images use next/image (not <img>)
+□ Large components use dynamic() import
+□ Polling uses React Query (not setInterval)
+□ Database queries select specific fields (not SELECT *)
+□ No console.log in production code
+□ Bundle size < 200KB (check with next/bundle-analyzer)
+
+
+SECURITY CHECKLIST
+──────────────────────────────────────────────────────────────────────────────
+□ Every route checks userId (multi-tenant safety)
+□ No secrets in client-side code
+□ OAuth tokens never logged
+□ Database queries use WHERE { userId } filter
+□ CORS properly configured
+□ Timestamps validated before storing
+
+
+KEY LIBRARIES
+──────────────────────────────────────────────────────────────────────────────
+next              16.0.0     Framework
+react             19.0.0     UI library
+react-dom         19.0.0     React renderer
+typescript        5.0.0      Type checking
+tailwindcss       3.0.0      Styling
+@xyflow/react     11.0.0     Workflow canvas (nodes + edges)
+@prisma/client    5.0.0      Database ORM
+@clerk/nextjs     5.0.0      Authentication
+@tanstack/react-query 5.0.0  Data fetching + polling
+shadcn/ui         latest     UI component library
+zod               latest     Schema validation
+
+
+USEFUL URLS
+──────────────────────────────────────────────────────────────────────────────
+Localhost:
+  http://localhost:3000              Frontend
+  http://localhost:8000/docs         Python API docs (FastAPI)
+  http://localhost:6333/dashboard    Qdrant console
+  http://localhost:5432              Postgres (psql CLI)
+  http://localhost:6379              Redis (redis-cli)
+
+Documentation:
+  docs/architecture/architecture.txt        Backend architecture
+  docs/architecture/frontend_architecture.txt Frontend architecture
+  QUICK_REFERENCE.md                        Quick reference guide
+  FILE_RELATIONS.md                         Complete data flow
+
+
+NEXT STEP IF STUCK
+──────────────────────────────────────────────────────────────────────────────
+1. Check: Is this a server or client component?
+   → No "use client" = server component (can use Prisma)
+   → Has "use client" = client component (can use hooks)
+
+2. Check: Is auth required?
+   → const { userId } = await auth()
+   → WHERE { userId } filter in Prisma queries
+
+3. Check: Is it a mutation or read?
+   → Mutation: Use Server Action or POST API route
+   → Read: Use page component or GET API route
+
+4. Check: Does data need real-time updates?
+   → Yes: Use React Query with refetchInterval
+   → No: Fetch once in server component
+
+5. Check: Are you accessing another user's data?
+   → Should fail (correct). Fix: Add userId to WHERE clause.
+
+
+================================================================================

@@ -1,0 +1,23 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Copy package files plus the Prisma schema/config so the postinstall
+# "prisma generate" hook has what it needs (and engines get installed).
+COPY package.json pnpm-lock.yaml prisma.config.ts ./
+COPY prisma ./prisma
+
+# Install dependencies (runs postinstall -> prisma generate successfully)
+RUN pnpm install
+
+# Copy the rest of the code
+COPY . .
+
+# Expose port
+EXPOSE 3000
+
+# Run dev server
+CMD ["pnpm", "dev"]

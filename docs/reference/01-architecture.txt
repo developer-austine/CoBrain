@@ -1,0 +1,160 @@
+# 01 · Architecture
+
+## The four processes
+
+| Process | Tech | Responsibility |
+|---------|------|----------------|
+| **Web app** | Next.js 16 (App Router, Turbopack), React 19 | UI, API routes, server actions, auth, orchestration |
+| **Ingest worker** | Python | Pops the Redis queue, runs the processing pipeline, writes vectors |
+| **Search API** | Python + FastAPI | Embeds a query, searches Qdrant, returns ranked chunks |
+| **Celery worker / beat** | Python | Scheduled + background connector syncs |
+
+Backed by four stores:
+
+| Store | Holds | Why |
+|-------|-------|-----|
+| **Postgres** | Workflows, connections, ingested records, BrainBlocks, chat | The **source of truth**. Citations resolve here. |
+| **Qdrant** | Chunk vectors + payload (`source`, `namespace`, `parent_doc_id`) | Semantic search |
+| **Redis** | The `company_brain:ingest` queue | Decouples ingestion from the request cycle |
+| **MinIO** | Uploaded file bytes | Data sovereignty — files stay in your stack |
+
+> **Auth is a separate database.** Better Auth uses its own Postgres
+> (`AUTH_DATABASE_URL`, typically Neon); business data uses `DATABASE_URL`.
+> They are deliberately not the same database.
+
+## System diagram
+
+```mermaid
+flowchart TB
+    U([User])
+
+    subgraph Next["Next.js — app/"]
+        direction TB
+        UI["UI<br/>Home · Brain · Sources<br/>Connectors · Chat"]
+        API["Route handlers<br/>/api/*"]
+        ACT["Server actions<br/>actions/*"]
+    end
+
+    subgraph Libs["Domain logic — lib/"]
+        direction TB
+        INT["interactive/<br/>references · intentClassifier<br/>sourceScope · pageMutation"]
+        CHAT["chat/<br/>rag · documents · sourceIntent"]
+        WF["workflow/<br/>executionPlan · knowledgeScope"]
+        SRC["sources/<br/>storage · extract · constants"]
+    end
+
+    subgraph Py["Python — backend/python/"]
+        direction TB
+        ING["workers/ingest.py"]
+        PIPE["pipeline/<br/>normalizer → pii → dedup<br/>→ chunker → embedder"]
+        SAPI["api/search.py"]
+        MAP["mappers/*"]
+    end
+
+    PG[(Postgres)]
+    RD[(Redis)]
+    QD[(Qdrant)]
+    MI[(MinIO)]
+
+    U --> UI --> ACT & API
+    API --> INT & CHAT & SRC
+    ACT --> WF & SRC
+    ACT & API --> PG
+    SRC --> MI
+    API -->|LPUSH| RD
+    RD -->|BRPOP| ING --> MAP --> PIPE --> QD
+    ING --> PG
+    CHAT -->|POST /api/search| SAPI --> QD
+    CHAT -->|resolve doc ids| PG
+```
+
+## Request paths
+
+### A question (`QUERY`)
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant P as POST /api/prompt
+    participant S as sourceScope
+    participant R as rag.ts
+    participant F as search-api
+    participant Q as Qdrant
+    participant D as Postgres
+
+    U->>P: { text, references:[@notion] }
+    P->>P: parseSubmission → prose + refs
+    P->>P: classifyIntent → QUERY
+    P->>S: resolveSearchSources
+    S-->>P: ["notion"]
+    P->>R: streamRagAnswer(sources)
+    R->>F: /api/search { query, sources:["notion"] }
+    F->>Q: vector search + source filter
+    Q-->>F: ranked chunks
+    F-->>R: chunks
+    R->>R: groupChunksByDocument
+    R->>D: resolve each doc id → title/url
+    D-->>R: provenance
+    R->>R: Claude synthesises across ALL docs
+    R-->>U: SSE tokens + citations [1][2][3]
+```
+
+### A write (`WRITE`)
+
+The key subtlety: **`@brain` is the destination, never the thing you read.**
+"Edit the `@brain` page with tasks from `@notion`" must read *Notion*.
+
+```mermaid
+flowchart LR
+    A["'Edit @brain with<br/>tasks from @notion'"] --> B[parseSubmission]
+    B --> C["writeTargets = [brain]<br/>contextRefs = [notion]"]
+    C --> D[classifyIntent → WRITE]
+    D --> E["resolveSearchSources(WRITE)<br/>→ ['notion']"]
+    E --> F[retrieveDocuments from Notion]
+    F --> G["draftFromSources()<br/>Claude extracts who/when/why"]
+    G --> H[validate → confidence gate]
+    H -->|≥ 0.7| I[(BrainBlock: active)]
+    H -->|< 0.7| J[(BrainBlock: review queue)]
+    I --> K[dual-write to Qdrant<br/>source='brain']
+```
+
+## Design rules (do not break these)
+
+1. **Postgres is truth; Qdrant is an index.** A vector is worthless without its
+   `parent_doc_id`. Never render an answer from Qdrant text alone — always
+   resolve the id so the user gets a real link.
+
+2. **Mentions are structured tokens, never parsed text.** The prompt box submits
+   `{ text, references: [{type,id,label}] }`. Do not regex `@notion` out of a
+   string — a user may legitimately type an email address.
+
+3. **Scope the search or email will win.** Email out-volumes everything. If a
+   query names a source, the vector search is **filtered** to it. See
+   [03-intelligence-layer.txt](./03-intelligence-layer.txt).
+
+4. **Regroup chunks into documents before synthesis.** A flat top-k of chunks
+   lets one chatty document crowd out every other document, producing a single
+   narrow answer. `groupChunksByDocument()` is what makes "list every task
+   across all my Notion pages" work.
+
+5. **Every AI write is provenanced and reversible.** `sourceRefs` on a
+   `BrainBlock` points at the exact documents it was derived from. Low-confidence
+   writes land in a review queue, not on the page.
+
+6. **`namespace` and `source` must stay indexed in Qdrant.** Without keyword
+   payload indexes, every filtered search full-scans the collection and times
+   out. `ensure_payload_indexes()` runs on search-api startup. See
+   [06-operations.txt](./06-operations.txt#known-failure-modes).
+
+## Why the pieces are where they are
+
+- **`lib/` holds pure domain logic** with no I/O where possible
+  (`sourceIntent`, `documents`, `knowledgeScope`, `sourceScope`,
+  `sources/constants`). That is why they are unit-testable without a database
+  and why the test suite runs in seconds.
+- **`actions/` are server actions** (mutations invoked from client components).
+- **`app/api/` are route handlers** — used where we need streaming (SSE),
+  webhooks, OAuth callbacks, or file bytes.
+- **Python owns the pipeline** because the ML libraries (sentence-transformers,
+  presidio, spaCy) live there. It does **not** own the schema — Prisma does.
+  Python reads/writes tables that Prisma defines.

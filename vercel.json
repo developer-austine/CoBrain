@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "app/api/cron/sync/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/cron/extract/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/drive/sync/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/cron/metering/route.ts": {
+      "maxDuration": 60
+    }
+  }
+}

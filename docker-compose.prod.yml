@@ -1,0 +1,223 @@
+# Production stack — host-agnostic.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d
+#
+# CI/CD passes a second env file pinning each image to a commit SHA:
+#   ... --env-file .env.production --env-file .env.release up -d
+# When those vars are unset the `build:` blocks below take over, so a manual
+# deploy from a checkout still works exactly as before.
+#
+# Differences from backend/docker-compose.yml (dev):
+#   - no source bind-mounts; everything is baked into images
+#   - all secrets come from the env file (no defaults)
+#   - data services bind to localhost only (put a TLS proxy in front of `app`)
+#   - migrations run once, in their own service, before the app starts
+#   - healthchecks + restart policies on everything
+#
+# To use managed services instead (Neon / Upstash / Qdrant Cloud / S3), delete
+# the corresponding service below and point the *_URL vars at the provider.
+
+name: cobrain-prod
+
+x-python-env: &python-env
+  DB_CONN_STR: ${DATABASE_URL}
+  REDIS_URL: ${REDIS_URL}
+  QDRANT_URL: ${QDRANT_URL}
+  QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+  QDRANT_COLLECTION: ${QDRANT_COLLECTION:-company_brain}
+  PYTHONDONTWRITEBYTECODE: "1"
+  PYTHONUNBUFFERED: "1"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY:-}
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "127.0.0.1:6333:6333"
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # Applies Prisma migrations once, then exits. The app waits on it.
+  migrate:
+    # The `build` stage, not the runtime one: the standalone runtime image
+    # carries prisma/ (schema + migrations) but not the Prisma CLI, so
+    # `migrate deploy` cannot run from it.
+    image: ${MIGRATE_IMAGE:-cobrain-migrate:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: build
+    restart: "no"
+    command: ["pnpm", "exec", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # The only service with published ports. Everything else binds to localhost
+  # or stays on the compose network, so the attack surface is one process whose
+  # entire job is terminating TLS.
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates survive redeploys. Without this Caddy re-requests on every
+      # `up`, and Let's Encrypt rate-limits five failures per account per hour.
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+
+  app:
+    image: ${WEB_IMAGE:-cobrain-web:local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      APP_ENV: production
+      NODE_ENV: production
+      APP_URL: ${APP_URL}
+      DATABASE_URL: ${DATABASE_URL}
+      AUTH_DATABASE_URL: ${AUTH_DATABASE_URL}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET}
+      BETTER_AUTH_URL: ${APP_URL}
+      REDIS_URL: ${REDIS_URL}
+      PYTHON_BACKEND_URL: http://search-api:8000
+      QDRANT_URL: ${QDRANT_URL}
+      MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_USE_SSL: ${MINIO_USE_SSL}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      ASSEMBLYAI_API_KEY: ${ASSEMBLYAI_API_KEY:-}
+    ports:
+      # Bind to localhost; terminate TLS in a reverse proxy (Caddy/Nginx/ALB).
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # One shared image for every Python service (search-api, ingest, worker, beat).
+  search-api:
+    build:
+      context: ./backend
+      dockerfile: python/Dockerfile
+    image: ${BACKEND_IMAGE:-company_brain_backend:prod}
+    restart: unless-stopped
+    command: python -m uvicorn backend.python.api.search:create_search_app --factory --host 0.0.0.0 --port 8000
+    environment: *python-env
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    expose:
+      - "8000"
+    depends_on:
+      qdrant:
+        condition: service_started
+
+  ingest:
+    image: ${BACKEND_IMAGE:-company_brain_backend:prod}
+    restart: unless-stopped
+    command: python -m backend.python.workers.ingest
+    environment: *python-env
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      search-api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  worker:
+    image: ${BACKEND_IMAGE:-company_brain_backend:prod}
+    restart: unless-stopped
+    command: celery -A backend.python.workers.celery_app worker --loglevel=info
+    environment: *python-env
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      search-api:
+        condition: service_started
+      redis:
+        condition: service_healthy
+
+  beat:
+    image: ${BACKEND_IMAGE:-company_brain_backend:prod}
+    restart: unless-stopped
+    command: celery -A backend.python.workers.celery_app beat --loglevel=info
+    environment: *python-env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  caddy_data:
+  caddy_config:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  minio_data:
+  hf_cache:

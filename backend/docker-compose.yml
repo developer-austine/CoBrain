@@ -1,0 +1,297 @@
+services:
+  # PostgreSQL database (shared with Next.js via Prisma)
+  postgres:
+    image: postgres:15-alpine
+    container_name: company_brain_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: company_brain
+      POSTGRES_USER: company_brain
+      POSTGRES_PASSWORD: company_brain
+    # Host port 5433 to avoid clashing with the native Windows postgres on 5432.
+    # The internal port stays 5432, so other containers still use postgres:5432.
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U company_brain"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis message queue and LSH dedup index
+  redis:
+    image: redis:7-alpine
+    container_name: company_brain_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Qdrant vector database
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: company_brain_qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # Health check disabled - curl not available in qdrant image
+    # Qdrant starts successfully; dependency failure is from health check only
+
+  # MinIO object storage — uploaded source files stay inside the customer's
+  # infrastructure (data-sovereignty pitch). S3-compatible API on 9000,
+  # web console on 9001. Credentials must match MINIO_* in the root .env.
+  minio:
+    image: minio/minio:latest
+    container_name: company_brain_minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: cobrain
+      MINIO_ROOT_PASSWORD: cobrain-dev-secret
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Python ingest worker (Celery)
+  worker:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    image: company_brain_backend:latest
+    container_name: company_brain_worker
+    command: celery -A backend.python.workers.celery_app worker --loglevel=info
+    environment:
+      DATABASE_URL: postgresql://company_brain:company_brain@postgres:5432/company_brain
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      LOG_LEVEL: INFO
+      # The python/ tree is volume-mounted from Windows; stale .pyc files there
+      # shadow edited source (mtime quirks), so never write bytecode.
+      PYTHONDONTWRITEBYTECODE: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      - ./python:/app/backend/python
+      # Persist the sentence-transformers model download across container
+      # recreations (it is ~90MB and the connection here is slow/flaky).
+      - hf_cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+  # Ingest consumer: drains the Redis "company_brain:ingest" list and runs the
+  # real document pipeline (normalize -> PII -> dedup -> chunk -> embed -> Qdrant).
+  # This is what actually processes documents; the celery worker above only runs
+  # the periodic maintenance tasks scheduled by beat.
+  ingest:
+    # Shares the same image as the worker (identical build) — built once,
+    # reused here so only the command differs (no second ~6.5GB image).
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    image: company_brain_backend:latest
+    container_name: company_brain_ingest
+    command: python -m backend.python.workers.ingest
+    environment:
+      DATABASE_URL: postgresql://company_brain:company_brain@postgres:5432/company_brain
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      LOG_LEVEL: INFO
+      # The python/ tree is volume-mounted from Windows; stale .pyc files there
+      # shadow edited source (mtime quirks), so never write bytecode.
+      PYTHONDONTWRITEBYTECODE: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      - ./python:/app/backend/python
+      # Persist the sentence-transformers model download across container
+      # recreations (it is ~90MB and the connection here is slow/flaky).
+      - hf_cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+  # Celery Beat scheduler (periodic tasks)
+  beat:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    image: company_brain_backend:latest
+    container_name: company_brain_beat
+    command: celery -A backend.python.workers.celery_app beat --loglevel=info
+    # Beat pokes the Next.js scheduler, so it needs CRON_SECRET + APP_URL from
+    # backend/.env. The explicit environment block below still wins for the
+    # infra hostnames (compose precedence: environment > env_file).
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://company_brain:company_brain@postgres:5432/company_brain
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      LOG_LEVEL: INFO
+      # The python/ tree is volume-mounted from Windows; stale .pyc files there
+      # shadow edited source (mtime quirks), so never write bytecode.
+      PYTHONDONTWRITEBYTECODE: "1"
+    extra_hosts:
+      # Lets Beat reach the Next.js dev server running on the Windows host.
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./python:/app/backend/python
+      # Persist the sentence-transformers model download across container
+      # recreations (it is ~90MB and the connection here is slow/flaky).
+      - hf_cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+  # Python FastAPI search service
+  search-api:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    image: company_brain_backend:latest
+    container_name: company_brain_search_api
+    command: python -m uvicorn backend.python.api.search:create_search_app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://company_brain:company_brain@postgres:5432/company_brain
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      PYTHONPATH: /app/backend/python:/app/backend/python/pipeline
+      LOG_LEVEL: INFO
+      # The python/ tree is volume-mounted from Windows; stale .pyc files there
+      # shadow edited source (mtime quirks), so never write bytecode.
+      PYTHONDONTWRITEBYTECODE: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      - ./python:/app/backend/python
+      # Persist the sentence-transformers model download across container
+      # recreations (it is ~90MB and the connection here is slow/flaky).
+      - hf_cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+  # Forecasting engine (TFT). Starts with the stack so the Forecasts page works
+  # without anyone having to run a Python module by hand.
+  forecast-api:
+    build:
+      context: .
+      dockerfile: python/Dockerfile
+    image: company_brain_backend:latest
+    container_name: company_brain_forecast_api
+    command: >
+      python -m uvicorn m_learning.inference.serve:create_app
+      --factory --host 0.0.0.0 --port 8100
+    ports:
+      - "8100:8100"
+    environment:
+      DATABASE_URL: postgresql://company_brain:company_brain@postgres:5432/company_brain
+      # m_learning is imported as a top-level package (from m_learning.config
+      # import CFG), so its parent must be on the path.
+      PYTHONPATH: /app/backend/python
+      PYTHONDONTWRITEBYTECODE: "1"
+      # Point every store at the mounted source tree, so a model trained on the
+      # host is the same model the container serves.
+      FEATURE_STORE_ROOT: /app/backend/python/m_learning/.feature_store
+      FORECAST_STORE_ROOT: /app/backend/python/m_learning/.forecast_store
+      CHECKPOINT_DIR: /app/backend/python/m_learning/checkpoints
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Only m_learning is mounted. Mounting ./python over /app/backend/python
+      # (as the other services do) would shadow the m_learning the image copied
+      # in, and the service would fail to import itself.
+      - ./m_learning:/app/backend/python/m_learning
+    restart: unless-stopped
+
+  # Next.js frontend (development mode)
+  # Behind the "frontend" profile so it does NOT start with a plain
+  # `docker-compose up` — the frontend is run locally via `pnpm dev`.
+  # To run it in Docker instead: `docker-compose --profile frontend up -d`.
+  frontend:
+    profiles: ["frontend"]
+    build:
+      context: ..
+      dockerfile: Dockerfile.dev
+    container_name: company_brain_frontend
+    ports:
+      - "3000:3000"
+    # Secrets (BETTER_AUTH_SECRET, NEON_DATABASE_URL, OAuth creds, etc.) are loaded
+    # from the project-root .env. The explicit environment block below overrides the
+    # infra hostnames so they resolve to docker-internal service names.
+    env_file:
+      - ../.env
+    environment:
+      DATABASE_URL: postgresql://company_brain:company_brain@postgres:5432/company_brain
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      PYTHON_BACKEND_URL: http://search-api:8000
+      BETTER_AUTH_URL: http://localhost:3000
+      NEXT_PUBLIC_BETTER_AUTH_URL: http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      search-api:
+        condition: service_started
+    volumes:
+      - ..:/app
+      - /app/node_modules
+      - /app/.next
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  hf_cache:
+  minio_data:
+
+networks:
+  default:
+    name: company_brain

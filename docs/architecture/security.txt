@@ -1,0 +1,572 @@
+================================================================================
+COMPANY BRAIN — SECURITY ARCHITECTURE
+================================================================================
+Document type    : Security design, threat model & implementation reference
+Audience         : Engineers + AI agents implementing/maintaining security
+Scope            : Full-stack security — auth, token storage, data flow, RBAC,
+                   pipeline security, infrastructure
+Location         : architecture/security.txt
+Status           : LIVING DOCUMENT — security is never "done". Update continuously.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. HOW TO READ THIS DOCUMENT
+--------------------------------------------------------------------------------
+Read in this order:
+  1. Section 1  — Security philosophy (the mindset)
+  2. Section 2  — What we are protecting (the assets)
+  3. Section 3  — The threat model (what we defend against)
+  4. Section 4  — Authentication: the Clerk -> custom auth migration
+  5. Section 5  — Encryption at rest (AES-256-GCM) — full implementation
+  6. Section 6  — Encryption in transit (TLS)
+  7. Section 7  — RBAC & namespace isolation
+  8. Section 8  — API route security (every route)
+  9. Section 9  — Pipeline & PII security
+  10. Section 10 — Secrets management
+  11. Section 11 — Audit logging
+  12. Section 12 — Rate limiting & abuse prevention
+  13. Section 13 — Implementation checklist & priority order
+  14. Section 14 — Security rules (non-negotiable)
+
+CRITICAL: This system holds up to 75 years of a company's most sensitive data
+AND OAuth tokens that grant access to live Gmail/Notion/GitHub accounts. A
+breach here is existential for the customer. Security is not a feature to add
+later. It is a property of every line of code.
+
+
+--------------------------------------------------------------------------------
+1. SECURITY PHILOSOPHY
+--------------------------------------------------------------------------------
+Four principles govern every decision:
+
+  ZERO TRUST
+    Never assume a request is safe because of where it came from. Every request
+    is authenticated and authorised at every boundary, not just the front door.
+
+  DEFENCE IN DEPTH
+    No single control failure should expose data. Multiple independent layers
+    each have to fail before a breach occurs. If encryption fails, RBAC still
+    holds. If RBAC fails, audit logs still catch it.
+
+  LEAST PRIVILEGE
+    Every user, service, and token gets the minimum access required and nothing
+    more. A Viewer cannot see Admin data. A connector token is scoped to only
+    the data it needs.
+
+  DATA SOVEREIGNTY
+    The company's data and the keys that protect it stay under our control.
+    Plaintext secrets never touch disk. Encryption keys live outside the database.
+    Where possible, sensitive processing stays within our own infrastructure.
+
+
+--------------------------------------------------------------------------------
+2. WHAT WE ARE PROTECTING (THE ASSETS)
+--------------------------------------------------------------------------------
+Ranked by blast radius if compromised:
+
+  TIER 1 — CATASTROPHIC
+    - OAuth access + refresh tokens (Gmail, Notion, GitHub, custom).
+      A leaked token = live read access to the customer's entire inbox / workspace.
+    - The master encryption key (ENCRYPTION_KEY). Leaks all encrypted tokens at once.
+    - Custom auth signing keys (JWT secret / private key). Leaks = forge any session.
+
+  TIER 2 — SEVERE
+    - 75 years of ingested company documents (in Postgres staging + Qdrant vectors).
+    - User credentials (password hashes).
+    - The PII pseudonymisation mapping table (token -> real PII).
+
+  TIER 3 — HIGH
+    - User personal data (emails, names, roles).
+    - Audit logs (reveal system internals + who accessed what).
+    - Database connection strings, Redis URL, Qdrant credentials.
+
+Every control in this document maps back to protecting one or more of these.
+
+
+--------------------------------------------------------------------------------
+3. THREAT MODEL
+--------------------------------------------------------------------------------
+T1 — DATABASE BREACH (stolen Postgres dump)
+  Attacker obtains the database. If tokens are plaintext -> instant access to
+  every connected account.
+  DEFENCE: AES-256-GCM encryption of all tokens at rest (Section 5). Key lives
+  outside the DB, so a dump alone is useless.
+
+T2 — NAMESPACE BLEED (cross-tenant data leak)
+  A user query returns documents belonging to another user/team.
+  DEFENCE: Mandatory namespace filter on every Qdrant search; RBAC on every
+  route (Section 7).
+
+T3 — STOLEN SESSION / FORGED JWT
+  Attacker steals or forges a session token and impersonates a user.
+  DEFENCE: Short-lived access tokens, httpOnly+secure cookies, refresh-token
+  rotation, strong signing key, token revocation list (Section 4).
+
+T4 — UNAUTHENTICATED API ACCESS
+  An API route runs its logic without checking who is calling.
+  DEFENCE: Auth gate as the FIRST line of every route handler (Section 8).
+
+T5 — PROMPT INJECTION
+  Malicious text in an ingested document hijacks the LLM to leak data.
+  DEFENCE: Templated prompts (never concatenate user/doc text as instructions),
+  output scanning (Section 9).
+
+T6 — PII LEAK VIA LLM OUTPUT
+  The model surfaces personal data in an answer.
+  DEFENCE: PII scrubbed before embedding; output scanned before returning
+  (Section 9).
+
+T7 — SECRET LEAKAGE (in code, logs, or git)
+  Keys committed to git, printed in logs, or exposed to the browser.
+  DEFENCE: .env discipline, secret manager, never log secrets, server-only
+  usage (Section 10).
+
+T8 — QUEUE POISONING
+  Malicious payload pushed to Redis -> processed by Python worker.
+  DEFENCE: Schema validation on every payload before processing; Redis not
+  exposed to the public internet (Section 9 + 12).
+
+T9 — BRUTE FORCE / CREDENTIAL STUFFING
+  Automated login attempts against the custom auth.
+  DEFENCE: Rate limiting, account lockout, strong password hashing (Section 4 + 12).
+
+
+--------------------------------------------------------------------------------
+4. AUTHENTICATION — CLERK -> CUSTOM AUTH MIGRATION
+--------------------------------------------------------------------------------
+GOAL: Move off Clerk to a self-owned auth system so we control the security
+posture and can harden it as the company grows. This must be done carefully —
+auth is the single most security-critical subsystem.
+
+WHY MIGRATE:
+  - Own the logic: customise session lifetimes, MFA, device tracking, anomaly
+    detection on our terms.
+  - No third-party dependency holding the keys to every customer's account.
+  - Ability to meet enterprise compliance requirements (SOC 2, data residency)
+    that a managed provider may not satisfy.
+
+WHY THIS IS RISKY:
+  - Rolling your own auth is how most breaches happen. Follow this section exactly.
+  - Do NOT invent crypto. Use vetted libraries only.
+
+----------------------------------------
+4.1 CORE AUTH DESIGN
+----------------------------------------
+  PASSWORD HASHING
+    Algorithm : Argon2id (preferred) or bcrypt (cost factor >= 12).
+    Library   : Node — 'argon2' or 'bcrypt'. Never SHA/MD5 for passwords.
+    Rule      : Hash on the server only. Never send or store plaintext passwords.
+    Storage   : User.passwordHash (the hash only — never the password).
+
+  SESSION TOKENS (JWT)
+    Access token  : short-lived (15 minutes). Signed JWT.
+                    Claims: userId, role, sessionId, iat, exp.
+    Refresh token : long-lived (7-30 days). Opaque random string (NOT a JWT),
+                    stored hashed in DB so a DB leak cannot reuse it.
+    Signing       : Access tokens signed with a strong secret/private key.
+                    Prefer asymmetric (RS256/EdDSA) so verification keys can be
+                    distributed without exposing the signing key.
+
+  TOKEN STORAGE ON CLIENT
+    Access + refresh tokens stored in httpOnly, secure, sameSite=strict cookies.
+    NEVER in localStorage (XSS-readable). httpOnly means JS cannot read them.
+
+  REFRESH TOKEN ROTATION
+    On each refresh: issue a NEW refresh token, invalidate the old one. If an old
+    (already-rotated) refresh token is reused, treat it as theft -> revoke the
+    entire session family. This detects stolen refresh tokens.
+
+  SESSION REVOCATION
+    Maintain a Session table. Each session has an ID. Logout / suspected theft
+    deletes the session row. Access tokens carry sessionId; verify the session
+    still exists (or check a fast Redis revocation set) for sensitive actions.
+
+  MFA (add as the company grows)
+    TOTP (authenticator app) first. WebAuthn / passkeys later for enterprise.
+    Enforce MFA for all roles above Viewer.
+
+----------------------------------------
+4.2 PRISMA SCHEMA FOR CUSTOM AUTH
+----------------------------------------
+  model User {
+    id            String   @id @default(uuid())
+    email         String   @unique
+    passwordHash  String                       // Argon2id hash only
+    role          String   @default("viewer")  // owner|admin|analyst|viewer
+    mfaSecret     String?                       // encrypted TOTP secret (AES-256)
+    mfaEnabled    Boolean  @default(false)
+    failedLogins  Int      @default(0)
+    lockedUntil   DateTime?
+    createdAt     DateTime @default(now())
+    updatedAt     DateTime @updatedAt
+    sessions      Session[]
+  }
+
+  model Session {
+    id                String   @id @default(uuid())
+    userId            String
+    refreshTokenHash  String                    // hash of refresh token, never raw
+    userAgent         String?
+    ipAddress         String?
+    expiresAt         DateTime
+    revokedAt         DateTime?
+    createdAt         DateTime @default(now())
+    user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+    @@index([userId])
+  }
+
+----------------------------------------
+4.3 MIGRATION STRATEGY (CLERK -> CUSTOM)
+----------------------------------------
+  PHASE 1 — Build alongside Clerk (no cutover yet)
+    - Implement custom auth routes: /api/auth/register, /login, /refresh, /logout.
+    - Implement password hashing, session creation, JWT issue/verify.
+    - Build a new middleware that verifies the custom JWT.
+    - Keep Clerk live in parallel. Do not switch yet.
+
+  PHASE 2 — Migrate user records
+    - Export Clerk users (id, email). Create matching User rows.
+    - Passwords cannot be exported from Clerk (they are hashed by Clerk).
+      -> Force a password reset flow on first login for migrated users, OR
+      -> run a dual-auth window where users set a new password on next login.
+    - Map Clerk userId -> new User.id everywhere it is referenced
+      (ConnectorToken.userId, Workflow.userId, etc.). Keep the same userId values
+      if possible to avoid rewriting foreign keys.
+
+  PHASE 3 — Cutover
+    - Swap middleware from Clerk's to the custom JWT middleware.
+    - Replace all `auth()` calls (Clerk) with the custom session resolver.
+    - Remove Clerk SDK and env vars.
+
+  PHASE 4 — Harden
+    - Add MFA. Add device/session management UI. Add login anomaly detection
+      (new device, new country -> challenge). Add audit logging on all auth events.
+
+  IMPORTANT: Until Phase 3 is complete and tested, do NOT remove Clerk. Run both,
+  verify the custom path on a staging environment with real flows first.
+
+----------------------------------------
+4.4 THE SESSION RESOLVER (replaces Clerk's auth())
+----------------------------------------
+  Every protected route and server action calls a single function, e.g.
+  getCurrentUser(req):
+    1. Read access token from httpOnly cookie.
+    2. Verify JWT signature + expiry.
+    3. (For sensitive actions) confirm sessionId is not revoked (Redis/DB check).
+    4. Return { userId, role } or null.
+  This is the ONE place auth is resolved. Never re-implement it per route.
+
+
+--------------------------------------------------------------------------------
+5. ENCRYPTION AT REST — AES-256-GCM (FULL IMPLEMENTATION)
+--------------------------------------------------------------------------------
+WHAT MUST BE ENCRYPTED AT REST:
+  - All OAuth access tokens and refresh tokens (Gmail, Notion, GitHub, custom).
+  - MFA secrets (TOTP seeds).
+  - Any other Tier-1/Tier-2 secret stored in Postgres.
+  (Passwords are HASHED, not encrypted — different operation, Section 4.)
+
+WHY AES-256-GCM (not CBC, not ECB):
+  - AES-256: 256-bit key, the current standard for symmetric encryption.
+  - GCM (Galois/Counter Mode): provides BOTH confidentiality AND integrity. The
+    auth tag proves the ciphertext was not tampered with. CBC has no integrity;
+    ECB leaks patterns. Always GCM.
+
+THE THREE STORED COMPONENTS PER ENCRYPTED VALUE:
+  1. ciphertext : the encrypted data (hex)
+  2. iv         : the 12-byte initialisation vector (hex) — FRESH RANDOM per encryption
+  3. authTag    : the 16-byte GCM authentication tag (hex)
+  All three are required to decrypt. Store all three. NEVER reuse an IV.
+
+THE MASTER KEY (ENCRYPTION_KEY):
+  - 32 bytes (256 bits), stored as a 64-char hex string.
+  - Lives ONLY in environment variables (dev) or a secret manager / KMS (prod).
+  - NEVER in the database, NEVER in source code, NEVER in logs.
+  - Generate once:  node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  - Rotation: plan for key rotation every 90 days in production (see 5.3).
+
+----------------------------------------
+5.1 REFERENCE IMPLEMENTATION (lib/encryption.ts)
+----------------------------------------
+  import crypto from "crypto";
+
+  const ALGORITHM = "aes-256-gcm";
+  const IV_BYTES  = 12;   // 96-bit IV — recommended for GCM
+  const KEY_BYTES = 32;   // 256-bit key
+
+  function getKey(): Buffer {
+    const hex = process.env.ENCRYPTION_KEY;
+    if (!hex) throw new Error("ENCRYPTION_KEY not set");
+    const key = Buffer.from(hex, "hex");
+    if (key.length !== KEY_BYTES)
+      throw new Error("ENCRYPTION_KEY must be 64 hex chars (32 bytes)");
+    return key;
+  }
+
+  export interface EncryptedField {
+    ciphertext: string;  // hex
+    iv:         string;  // hex
+    tag:        string;  // hex
+  }
+
+  export function encrypt(plaintext: string): EncryptedField {
+    const iv = crypto.randomBytes(IV_BYTES);              // FRESH iv every time
+    const cipher = crypto.createCipheriv(ALGORITHM, getKey(), iv);
+    const enc = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+    return {
+      ciphertext: enc.toString("hex"),
+      iv:         iv.toString("hex"),
+      tag:        cipher.getAuthTag().toString("hex"),
+    };
+  }
+
+  export function decrypt(f: EncryptedField): string {
+    const decipher = crypto.createDecipheriv(
+      ALGORITHM, getKey(), Buffer.from(f.iv, "hex")
+    );
+    decipher.setAuthTag(Buffer.from(f.tag, "hex"));       // verifies integrity
+    const dec = Buffer.concat([
+      decipher.update(Buffer.from(f.ciphertext, "hex")),
+      decipher.final(),                                    // throws if tampered
+    ]);
+    return dec.toString("utf8");
+  }
+
+----------------------------------------
+5.2 SCHEMA CHANGES FOR ENCRYPTED TOKENS
+----------------------------------------
+  Replace single plaintext token columns with three columns each.
+  Example for GmailConnection:
+
+    accessTokenEnc   String
+    accessTokenIv    String
+    accessTokenTag   String
+    refreshTokenEnc  String?
+    refreshTokenIv   String?
+    refreshTokenTag  String?
+
+  Apply the same pattern to NotionConnection, GitHubConnection,
+  CustomConnection.clientSecret, CustomConnection.webhookSecret, and User.mfaSecret.
+
+  USAGE PATTERN:
+    On write  : enc = encrypt(rawToken); store enc.ciphertext, enc.iv, enc.tag.
+    On read   : rawToken = decrypt({ ciphertext, iv, tag }); use in memory only;
+                let it go out of scope immediately. Never log it, never return it
+                in an API response, never put it in a header sent to the browser.
+
+----------------------------------------
+5.3 KEY ROTATION (production)
+----------------------------------------
+  - Support TWO keys at once: ENCRYPTION_KEY (current) + ENCRYPTION_KEY_PREVIOUS.
+  - Decrypt tries current key, falls back to previous.
+  - A background job re-encrypts all rows with the new key, then the previous key
+    is retired.
+  - In production, prefer envelope encryption with a cloud KMS (AWS KMS / GCP KMS):
+    a per-record data key encrypts the value; the KMS master key encrypts the data
+    key. The master key never leaves the KMS.
+
+
+--------------------------------------------------------------------------------
+6. ENCRYPTION IN TRANSIT — TLS
+--------------------------------------------------------------------------------
+  - TLS 1.3 enforced on all public endpoints. HTTP redirects to HTTPS. HSTS header set.
+  - All connections to Postgres, Redis, and Qdrant use TLS in production
+    (sslmode=require for Postgres; rediss:// for Redis; https for Qdrant).
+  - Internal service-to-service traffic (Next.js <-> Python workers, if networked)
+    uses TLS or runs only inside a private network (VPC) never exposed publicly.
+  - Connector API calls (to Google/Notion/GitHub) are already HTTPS — verify
+    certificates, never disable TLS verification.
+
+
+--------------------------------------------------------------------------------
+7. RBAC & NAMESPACE ISOLATION
+--------------------------------------------------------------------------------
+ROLES (least privilege):
+  owner   : full control, billing, user management, all data.
+  admin   : manage connectors, view all data, manage team (no billing).
+  analyst : query, view analytics/forecasts, no connector management.
+  viewer  : query only, scoped to permitted namespaces.
+
+THE NAMESPACE — THE CORE ISOLATION PRIMITIVE:
+  Format     : "userId:scope"  or  "orgId:teamScope"
+  Created    : at retrieval time in Next.js, attached to the QueuePayload.
+  Flows      : QueuePayload -> RawDocument metadata -> Chunk -> Qdrant payload.
+  Enforced   : EVERY Qdrant search MUST include a filter:
+                 must = [ namespace == requestingUser.namespace ]
+               Qdrant will not return any point outside the namespace, regardless
+               of vector similarity. This is the wall that prevents data bleed.
+
+RULES:
+  - Namespace is set server-side from the authenticated session. NEVER trust a
+    namespace supplied by the client.
+  - A query's namespace is derived from getCurrentUser(), not from request body.
+  - The vector store filter is a `must` condition, never a `should`.
+
+
+--------------------------------------------------------------------------------
+8. API ROUTE SECURITY (EVERY ROUTE)
+--------------------------------------------------------------------------------
+EVERY API route handler follows this exact order, top to bottom:
+
+  1. AUTHENTICATE   : user = getCurrentUser(req); if (!user) return 401.
+  2. AUTHORISE      : check user.role permits this action; else return 403.
+  3. RATE LIMIT     : check per-user / per-IP limit; else return 429.
+  4. VALIDATE INPUT : parse + validate body against a schema (zod); else 422.
+  5. SCOPE          : derive namespace from user, NOT from the request body.
+  6. EXECUTE        : run the actual logic.
+  7. AUDIT          : log the action (who, what, when) — Section 11.
+
+CURRENT GAP (must fix):
+  The existing connector sync routes accept { workflowId, nodeId } with NO auth
+  check. Anyone who knows a workflowId can trigger a sync and read data.
+  -> Add steps 1-3 to the top of EVERY existing route (gmail/notion/github/custom
+     auth, callback, status, sync). This is the highest-priority fix.
+
+OAUTH CALLBACK ROUTES — SPECIAL CARE:
+  - Verify the `state` parameter matches what was issued (CSRF protection).
+  - state should be a signed/encoded value tied to the user session, not guessable.
+  - Reject callbacks with missing/mismatched state.
+
+
+--------------------------------------------------------------------------------
+9. PIPELINE & PII SECURITY (Python backend)
+--------------------------------------------------------------------------------
+PII BEFORE EMBED (non-negotiable):
+  pipeline/pii.py runs BEFORE pipeline/chunker.py. No raw PII (names, emails,
+  phones, IDs, cards, secrets) may ever reach Qdrant. Detection: spaCy NER +
+  Presidio patterns. Default mode: pseudonymise (reversible, mapping stored in a
+  restricted Postgres table). Sensitive categories (passwords, cards): redact
+  (irreversible).
+
+QUEUE PAYLOAD VALIDATION:
+  workers/ingest.py validates every payload popped from Redis against the
+  QueuePayload schema BEFORE processing. Malformed or unexpected payloads are
+  rejected and logged — never blindly executed (defends T8 queue poisoning).
+
+PROMPT INJECTION DEFENCE (RAG engine, when built):
+  - User input and retrieved document text are inserted into the prompt as DATA,
+    via templating — never concatenated as instructions.
+  - System instructions are fixed and separated from retrieved content.
+  - LLM output is scanned (Presidio) before being returned to the client.
+
+LLM KEYS SERVER-SIDE ONLY:
+  Any LLM API key is used only on the server. The browser receives streamed text,
+  never the key.
+
+REDIS & QDRANT NOT PUBLIC:
+  Redis and Qdrant bind to private network interfaces only. They are never
+  exposed to the public internet. Access requires being inside the VPC / private
+  network. Add auth (Redis ACL, Qdrant API key) on top.
+
+
+--------------------------------------------------------------------------------
+10. SECRETS MANAGEMENT
+--------------------------------------------------------------------------------
+  - ALL secrets live in .env (dev) or a secret manager / KMS (prod). Never in code.
+  - .env MUST be in .gitignore. Verify: `git check-ignore .env` returns ".env".
+  - Provide .env.example with KEYS ONLY (no values) for onboarding.
+  - Secrets inventory (all must be protected):
+      ENCRYPTION_KEY, JWT signing key/secret, DATABASE_URL, REDIS_URL,
+      QDRANT_URL + key, GOOGLE_CLIENT_SECRET, NOTION_CLIENT_SECRET,
+      GITHUB_CLIENT_SECRET, custom connector secrets, LLM API keys.
+  - NEVER log a secret. Scrub secrets from error messages and stack traces.
+  - NEVER send a secret to the browser or include it in an API response.
+  - Rotate secrets on a schedule and immediately on any suspected exposure.
+
+
+--------------------------------------------------------------------------------
+11. AUDIT LOGGING
+--------------------------------------------------------------------------------
+WHAT TO LOG (append-only, tamper-evident where possible):
+  - Auth events    : login success/failure, logout, refresh, MFA, password change.
+  - Access events  : every RAG query (who, namespace, # results — NOT the answer text).
+  - Admin events   : connector connect/disconnect, role change, user add/remove.
+  - Data events    : sync triggered, documents ingested/processed/failed.
+
+WHAT NOT TO LOG:
+  - Never log secrets, tokens, passwords, or full document content / PII.
+  - Log identifiers and metadata, not sensitive payloads.
+
+PROPERTIES:
+  - Append-only. In production, ship logs to a separate store / SIEM so a DB
+    compromise cannot erase the trail.
+  - Each entry: timestamp, userId, action, resource, ip, userAgent, outcome.
+
+
+--------------------------------------------------------------------------------
+12. RATE LIMITING & ABUSE PREVENTION
+--------------------------------------------------------------------------------
+  - LOGIN          : per-IP + per-account. After N failures, lock account
+                     (User.failedLogins, User.lockedUntil). Exponential backoff.
+  - API ROUTES     : per-user sliding-window limit (Redis-backed). 429 on exceed.
+  - SYNC ROUTES    : per-connector cooldown (e.g. 1 sync/minute/user) to protect
+                     third-party API quotas and prevent abuse.
+  - GLOBAL EDGE    : WAF + DDoS protection at the edge (e.g. Cloudflare) in prod.
+  - INPUT LIMITS   : max query length, max payload size, reject oversized requests.
+
+
+--------------------------------------------------------------------------------
+13. IMPLEMENTATION CHECKLIST & PRIORITY ORDER
+--------------------------------------------------------------------------------
+DO IN THIS ORDER. Earlier items are higher risk / lower effort.
+
+  PRIORITY 1 — IMMEDIATE (highest exploitability, lowest effort)
+    [ ] Add auth gate (steps 1-3 of Section 8) to EVERY existing API route.
+    [ ] Confirm .env is gitignored; rotate any secret ever committed to git.
+
+  PRIORITY 2 — TOKEN ENCRYPTION
+    [ ] Add lib/encryption.ts (Section 5.1).
+    [ ] Generate ENCRYPTION_KEY, add to .env + secret manager.
+    [ ] Migrate token columns to enc/iv/tag triples (Section 5.2).
+    [ ] Update all token writes to encrypt, all reads to decrypt.
+
+  PRIORITY 3 — NAMESPACE ENFORCEMENT
+    [ ] Ensure namespace flows QueuePayload -> Qdrant payload.
+    [ ] Add mandatory namespace `must` filter to every Qdrant search.
+
+  PRIORITY 4 — CUSTOM AUTH MIGRATION (Section 4)
+    [ ] Phase 1: build custom auth routes alongside Clerk.
+    [ ] Phase 2: migrate users + force password reset.
+    [ ] Phase 3: cutover middleware, remove Clerk.
+    [ ] Phase 4: add MFA, session management, anomaly detection.
+
+  PRIORITY 5 — PIPELINE HARDENING
+    [ ] PII scrubber before embed (verify ordering).
+    [ ] QueuePayload schema validation in ingest worker.
+    [ ] Redis + Qdrant on private network only, with auth.
+
+  PRIORITY 6 — OPERATIONAL
+    [ ] Audit logging (Section 11).
+    [ ] Rate limiting (Section 12).
+    [ ] TLS everywhere (Section 6).
+    [ ] Key rotation job (Section 5.3).
+
+  ONGOING
+    [ ] Dependency scanning (e.g. Snyk) on every PR.
+    [ ] Periodic security review of this document as the system grows.
+    [ ] Penetration test before any production launch.
+
+
+--------------------------------------------------------------------------------
+14. SECURITY RULES (NON-NEGOTIABLE)
+--------------------------------------------------------------------------------
+  - Auth is the FIRST line of every protected route. No logic runs before it.
+  - Tokens are NEVER stored in plaintext. AES-256-GCM, key outside the DB.
+  - Passwords are HASHED (Argon2id/bcrypt), never encrypted, never stored raw.
+  - The master key NEVER touches the database, source code, or logs.
+  - A fresh random IV per encryption. Never reuse an IV.
+  - Namespace is set server-side from the session. Never trust client namespace.
+  - Every Qdrant search filters on namespace with a `must` condition.
+  - No raw PII ever reaches the vector store. PII scrubber runs before embed.
+  - Secrets never reach the browser. LLM/API keys are server-side only.
+  - Never log secrets, tokens, passwords, or PII.
+  - .env is always gitignored. A committed secret is a rotated secret.
+  - Validate every external input: API bodies, OAuth state, Redis payloads.
+  - Do NOT invent cryptography. Use vetted libraries (node:crypto, argon2, etc).
+  - Fail closed: on any doubt about authorisation, deny.
+  - Until custom auth is fully tested in staging, do not remove Clerk.
+
+================================================================================
+END OF SECURITY DOCUMENT
+================================================================================

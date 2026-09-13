@@ -1,0 +1,201 @@
+# 04 · File Reference
+
+Every file, what it does, and what depends on it.
+
+## Dependency map (the important edges)
+
+```mermaid
+flowchart TB
+    subgraph Entry
+        PR["app/api/prompt/route.ts"]
+        CHR["app/api/chat/route.ts"]
+        UPR["app/api/sources/upload/route.ts"]
+    end
+
+    subgraph Interactive["lib/interactive/"]
+        REF[references.ts]
+        IC[intentClassifier.ts]
+        SS[sourceScope.ts]
+        PM[pageMutation.ts]
+        AC[agentConfigurator.ts]
+        RE[rulesEngine.ts]
+        IT[types.ts]
+    end
+
+    subgraph Chat["lib/chat/"]
+        RAG[rag.ts]
+        DOC[documents.ts]
+        SI[sourceIntent.ts]
+        FMT[format.ts]
+    end
+
+    subgraph Sources["lib/sources/"]
+        ST[storage.ts]
+        EX[extract.ts]
+        CO[constants.ts]
+    end
+
+    PR --> REF & IC & SS & PM & RAG
+    CHR --> RAG
+    UPR --> ST & EX & CO
+    SS --> SI
+    SS --> IT
+    RAG --> DOC & SI & FMT
+    PM --> RAG
+    REF --> IT
+    RAG --> PRISMA[(lib/prisma.ts)]
+    PM --> PUB[lib/queue/publisher.ts]
+    UPR --> PUB
+```
+
+> Note `pageMutation.ts → rag.ts`: the Brain writer **reuses the read path**, so
+> a written block is grounded in exactly what an answer would have cited.
+
+---
+
+## `lib/` — domain logic
+
+### `lib/chat/` — retrieval & answering
+
+| File | Purpose | Pure? |
+|------|---------|-------|
+| **`rag.ts`** | The RAG core. `retrieveChunks` → `retrieveDocuments` → `streamRagAnswer`. Also `resolveDocumentMeta()` (doc id → title/author/**url**) and `buildContext()`. Anything about answering a question starts here. | ✗ (I/O) |
+| **`documents.ts`** | `groupChunksByDocument()` — collapses ranked chunks back into ranked documents. The reason multi-document answers work. | ✓ |
+| **`sourceIntent.ts`** | `SOURCE_KEYS`, `isSourceKey()`, `detectSourceIntent()` — keyword → source mapping (word-boundary matched). | ✓ |
+| **`format.ts`** | `cleanForDisplay`, `truncateWords`, `deriveConversationTitle`. | ✓ |
+| **`types.ts`** | `Citation` and chat message contracts. | ✓ |
+
+### `lib/interactive/` — the @-mention intelligence layer
+
+| File | Purpose | Pure? |
+|------|---------|-------|
+| **`types.ts`** | The contracts: `PromptSubmission`, `ParsedPrompt`, `Intent`, `BrainBlockDraft`, `BRAIN_BLOCK_TYPES`, `DOMAIN_EVENTS`. Start here. | ✓ |
+| **`references.ts`** | `REFERENCE_CATALOG` (what the @-dropdown offers), `searchCatalog()`, `parseSubmission()`. | ✓ |
+| **`intentClassifier.ts`** | prose → `QUERY` \| `CONFIG` \| `WRITE` + confidence. Low confidence ⇒ ask, don't guess. | ✗ |
+| **`sourceScope.ts`** | `resolveSearchSources(parsed, intent)` — **the bridge from @-mentions to the vector filter.** Encodes "`@brain` on a WRITE is the destination, not the scope". | ✓ |
+| **`pageMutation.ts`** | The Page Mutation Engine. `draftFromWritePrompt` (dictation), **`draftFromSources`** (retrieve → Claude → structured block), `validateDraft`, `gateStatus`, `writeBrainBlock`, `embedBrainBlock`. | ✗ |
+| **`agentConfigurator.ts`** | `CONFIG` intent → a standing `AgentConfig` rule. | ✗ |
+| **`rulesEngine.ts`** | Fires standing rules on domain events. | ✗ |
+
+### `lib/sources/` — uploads
+
+| File | Purpose | Pure? |
+|------|---------|-------|
+| **`constants.ts`** | `MAX_UPLOAD_BYTES` (25 MB), accepted types, `validateUpload()`, `kindForFile()`, `humanFileSize()`. | ✓ |
+| **`storage.ts`** | MinIO client: `putObject`, `getObject`, `removeObject`, `storageReachable`, `buildStorageKey`. `server-only`. | ✗ |
+| **`extract.ts`** | `extractText(kind, buffer)` — pdf-parse / mammoth / utf-8. | ✗ |
+
+### `lib/workflow/`
+
+| File | Purpose | Pure? |
+|------|---------|-------|
+| **`knowledgeScope.ts`** | `resolveUpstreamWorkflows` (transitive, cycle-safe), `resolveKnowledgeScope`, `canLink` (refuses cycles). | ✓ |
+| **`executionPlan.ts`** | Flow (nodes+edges) → topologically sorted `WorkflowExecutionPlan`; validates entry point, missing inputs, cycles. | ✓ |
+
+### `lib/` — infrastructure
+
+| File | Purpose |
+|------|---------|
+| `prisma.ts` | Singleton Prisma client (business DB). |
+| `auth.ts` / `auth-client.ts` / `get-session.ts` | Better Auth (separate auth DB). `getCurrentUserId()` is the one you'll use. |
+| `config/env.ts` | **Typed runtime config + production validation.** Fails boot on unsafe prod config. |
+| `queue/publisher.ts` | Redis client + `company_brain:ingest` publisher. |
+| `queue/queueWorkflowDocuments.ts` | Bulk-enqueue a workflow's pending documents. |
+| `onboarding/guard.ts` | `requireOnboarded()` — gates the `(dashboard)` layout. |
+| `pricing/plans.ts` | Plan definitions. |
+| `connector/createFlowNode.ts`, `createDefaultPipeline.ts` | Flow-editor node factory + the pre-wired starter pipeline. |
+| `hooks/useSpeechToText.ts` | AssemblyAI realtime STT. Exposes `levelRef` (live 0–1 mic loudness). |
+| `hooks/useTypewriter.ts` | Character reveal for growing speech partials. |
+| `hooks/useWaveform.ts` | rAF loop turning `levelRef` into amplitude-reactive bar heights (direct DOM writes). |
+| `utils.ts` | `cn()` (Tailwind class merge). |
+
+---
+
+## `app/` — routes
+
+### Pages
+
+| Route | File | Notes |
+|-------|------|-------|
+| `/` | `(dashboard)/(home)/page.tsx` | Workflow cards + **KnowledgeFlow** (links + uploads). |
+| `/brain` | `(dashboard)/brain/page.tsx` | Derived knowledge, review queue, standing rules. |
+| `/sources` | `(dashboard)/sources/page.tsx` | **Uploads only** — dropzone + file list. |
+| `/connectors/[workflowId]` | `connectors/[workflowId]/page.tsx` | Visual flow editor (`@xyflow/react`). |
+| `/activity/chat` | `activity/chat/_components/ChatClient.tsx` | The prompt box: @-mentions, voice pill, citations. |
+| `/settings`, `/onboarding` | — | Account; 6-step wizard. |
+| `/sign-in`, `/sign-up` | `(auth)/…` | Forced light theme via `.auth-light`. |
+
+Layouts: `app/(dashboard)/layout.tsx` calls `requireOnboarded()` — **every page
+under it is gated automatically.** `app/(auth)/layout.tsx` forces the light theme.
+
+### API routes
+
+| Route | Purpose |
+|-------|---------|
+| **`/api/prompt`** | **The interactive entry point** (SSE). parse → classify → audit → route to QUERY/CONFIG/WRITE. |
+| `/api/chat` | Legacy plain chat (SSE). Keyword scoping only. |
+| `/api/search` | Thin proxy to the Python search-api. |
+| `/api/sources/upload` | Multipart upload → MinIO → extract → queue. |
+| `/api/sources/[id]/download` | Streams the original file (the upload citation link). |
+| `/api/health` | Liveness + dependency readiness. 503 if Postgres is down. |
+| `/api/{gmail,notion,github,custom_api}/{auth,callback,sync,status}` | Connector OAuth + ingestion. |
+| `/api/stt/token` | Short-lived AssemblyAI token. |
+| `/api/workflow/[workflowId]/run` | Kicks off an execution. |
+| `/api/queue/flush` | Dev utility. |
+
+### Server actions (`actions/`)
+
+| File | Exports |
+|------|---------|
+| `workflows/workflowLinks.ts` | `listWorkflowLinks`, `linkWorkflows`, `unlinkWorkflows`, `getKnowledgeScope`. |
+| `workflows/*` | Workflow CRUD + `runWorkflow`. |
+| `sources/sources.ts` | `listUploadedSources`, `deleteUploadedSource`, `getStorageStatus`, `listConnectedSources`. |
+| `brain/brainBlocks.ts` | List/approve/reject BrainBlocks; list AgentConfigs. |
+| `chats/chatHistory.ts`, `onboarding/onboarding.ts`, `account/deleteAccount.ts` | — |
+
+---
+
+## `components/`
+
+| File | Purpose |
+|------|---------|
+| `sidebar.tsx` | Desktop + mobile nav. `navItemClasses()` drives both; collapsed rail centres icons; active state is a soft tint. |
+| `chat/SourceCitations.tsx` | Citations grouped by source, numbered to match `[n]` in the answer. `SOURCE_LABELS` lives here. |
+| `chat/VoicePill.tsx` | Listening pill under the prompt box (waveform + typed transcript). |
+| `chat/MicButton.tsx` | Start/stop only — the affordance is the pill. |
+| `chat/MessageBody.tsx` | Renders assistant Markdown. |
+| `Logo.tsx` | Accepts `wordmarkClassName` so the auth pages can force a dark wordmark. |
+| `ui/*` | Base UI + Tailwind primitives. **`Button` uses `render={<a/>}`, not `asChild`.** |
+
+---
+
+## `backend/python/`
+
+| Path | Purpose |
+|------|---------|
+| `workers/ingest.py` | BRPOPs the queue, runs the pipeline. **The main worker.** |
+| `workers/celery_app.py`, `scheduler.py` | Scheduled connector syncs. |
+| `api/search.py` | FastAPI `/api/search`. Accepts `sources[]` for source-scoped search. Ensures payload indexes on startup. |
+| `db/qdrant_client.py` | `search_qdrant` (namespace + source filters), `upsert_to_qdrant`, **`ensure_payload_indexes`**. |
+| `db/postgres_client.py` | `update_document_status` — the `table_map` that maps `source` → Prisma table. |
+| `db/redis_client.py` | Queue client. |
+| `mappers/*.py` | `QueuePayload` → `RawDocument`, one per source. `MAPPER_REGISTRY` in `__init__.py`. |
+| `pipeline/*.py` | normalizer → pii → deduplicator → chunker → embedder → publisher. |
+| `schemas/*.py` | `QueuePayload`, `RawDocument`, `NormalisedDocument`, `Chunk`. |
+
+---
+
+## Root config
+
+| File | Purpose |
+|------|---------|
+| `prisma/schema.prisma` | **The schema. Python does not own this.** |
+| `next.config.ts` | `output: "standalone"` for the prod image. |
+| `instrumentation.ts` | Boot hook → `assertProductionConfig()`. |
+| `proxy.ts` | Next 16 middleware — Edge session-cookie check + protected-route matcher. |
+| `Dockerfile` | Production image (multi-stage, non-root). |
+| `Dockerfile.dev` | Dev image. |
+| `docker-compose.prod.yml` | Production stack. |
+| `backend/docker-compose.yml` | **Dev stack — the one you run daily.** |
+| `.env.production.example` | Production env template. |
+| `vitest.config.ts` | Tests; aliases `@` and stubs `server-only`. |

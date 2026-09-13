@@ -1,0 +1,519 @@
+================================================================================
+COBRAIN — FORECAST INTERPRETATION LAYER
+NARRATIVE ENGINE · PLAIN-TERMS CARD · EXPLAIN DRAWER · INTERPRETATION BARS
+IMPLEMENTATION SPECIFICATION FOR THE ENGINEERING AGENT
+================================================================================
+Document type : UI + logic build specification. Single authoritative source.
+Applies to    : app/forecasts/* (extends the implemented Forecasts page)
+Relation      : Uses the dual-theme tokens of FORECAST_UI_DESIGN_SPEC.txt and
+                extends them (Section 2). Consumes the live forecast payload,
+                observed series, driver weights, calibration data (monitoring
+                module), and raw event timestamps.
+Design intent : Translate every number on the Forecasts page into plain
+                language and simple visuals, IN REAL TIME, without dumbing
+                down the numbers. Analysts keep sigma; everyone else gets
+                sentences and bars. Both audiences look at the same screen.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. AGENT — READ THIS FIRST
+--------------------------------------------------------------------------------
+THE ONE LAW OF THIS LAYER:
+  Every sentence and every bar is a DETERMINISTIC PURE FUNCTION of the live
+  forecast payload. Same values in → same words out, recomputed on every
+  poll and every signal switch. NO LLM CALLS in the render path. If a value
+  is missing, the dependent sentence/section is omitted — never invented.
+
+Rules:
+  - All colors via CSS variables in Section 2. Zero hardcoded hex in TSX.
+  - Both themes must render correctly; theme = data-theme attr on <html>.
+  - Human-readable feature names ONLY (Section 3.2). Raw feature ids like
+    "week cos" must never reach the DOM.
+  - Respect prefers-reduced-motion (Section 10).
+  - Do not ask clarifying questions about anything specified here.
+
+
+--------------------------------------------------------------------------------
+1. SYSTEM SUMMARY — WHAT YOU ARE BUILDING
+--------------------------------------------------------------------------------
+The disclosure ladder (each level opt-in, all bound to the same store):
+
+  LEVEL 1  Chart + signal ranking bars    main page     3-second glance
+  LEVEL 2  "In Plain Terms" card          top of rail   30-second read
+  LEVEL 3  Explain drawer                 right drawer  full interpretation
+
+  Component                 Where                    Data source
+  ------------------------  -----------------------  -------------------------
+  NarrativeEngine (logic)   lib/interpret/*          forecast payload (client)
+  PlainTermsCard            rail, ABOVE Scenarios    NarrativeEngine output
+  SignalRankingBars         main col, ABOVE hero     all signals' forecasts
+  ExplainHandle             right edge, fixed        drawer state + change flags
+  ExplainDrawer             overlay right panel      engine + drawer API extras
+   ├ KpiStrip               drawer top               payload + calibration
+   ├ DriverBars (expanded)  drawer                   var-selection weights
+   ├ ScenarioRange          drawer                   quantiles + anchors
+   ├ MomentumBars           drawer                   observed weekly deltas
+   ├ TrackRecordBars        drawer                   calibration hit/miss
+   ├ AfterHoursHeatmap      drawer (burnout only)    raw event timestamps
+   └ ExplainerCallout       drawer bottom            static template
+  CrossHighlight store      zustand                  shared with chart
+
+
+--------------------------------------------------------------------------------
+2. COLOR SCHEMA — DUAL THEME
+--------------------------------------------------------------------------------
+Extends FORECAST_UI_DESIGN_SPEC.txt Section 1 (those tokens remain the base:
+--bg-page, --bg-card, --bg-inset, --bg-selected, --border, --border-strong,
+--text-primary, --text-secondary, --text-muted, --accent, --accent-soft,
+--teal, --coral, --amber, --ice). ADD the following:
+
+```css
+:root, [data-theme="light"] {
+  /* interpretation layer */
+  --interp-hero-border:   #6D5EF0;                  /* plain-terms card edge */
+  --interp-hero-shadow:   0 4px 14px rgba(109,94,240,.14);
+  --verdict-bad:          #E0483F;                  /* worsening verdict text */
+  --verdict-good:         #0FA88C;                  /* improving verdict text */
+  --anchor-chip-bg:       #EEEDFB;                  /* "week of Jul 6" chip */
+  --anchor-chip-text:     #6D5EF0;
+
+  /* bars */
+  --bar-worsening:        #E0483F;
+  --bar-worsening-soft:   rgba(224, 72, 63, .55);
+  --bar-improving:        #0FA88C;
+  --bar-improving-soft:   rgba(15, 168, 140, .45);
+  --bar-track:            #F1F3F8;
+  --bar-zeroline:         rgba(15, 23, 42, .18);
+
+  /* heatmap (coral alpha ramp, 5 steps quiet→heavy) */
+  --heat-0: rgba(224,72,63,.06);  --heat-1: rgba(224,72,63,.15);
+  --heat-2: rgba(224,72,63,.30);  --heat-3: rgba(224,72,63,.55);
+  --heat-4: rgba(224,72,63,.85);
+
+  /* drawer */
+  --drawer-bg:            #FFFFFF;
+  --drawer-border:        rgba(15, 23, 42, .10);
+  --drawer-shadow:        -12px 0 32px rgba(15, 23, 42, .10);
+  --drawer-scrim:         rgba(15, 23, 42, .25);
+  --kpi-tile-bg:          #F7F8FB;
+  --callout-bg:           #FFFBEB;
+  --callout-border:       rgba(217, 138, 11, .40);
+  --handle-bg:            #6D5EF0;
+  --handle-text:          #FFFFFF;
+}
+
+[data-theme="dark"] {
+  --interp-hero-border:   #9B6DFF;
+  --interp-hero-shadow:   0 4px 18px rgba(155,109,255,.22);
+  --verdict-bad:          #FF5F6D;
+  --verdict-good:         #00E5CC;
+  --anchor-chip-bg:       #1A1D3A;
+  --anchor-chip-text:     #A8C8FF;
+
+  --bar-worsening:        #FF5F6D;
+  --bar-worsening-soft:   rgba(255, 95, 109, .55);
+  --bar-improving:        #00E5CC;
+  --bar-improving-soft:   rgba(0, 229, 204, .45);
+  --bar-track:            #13162A;
+  --bar-zeroline:         rgba(255, 255, 255, .22);
+
+  --heat-0: rgba(255,95,109,.07);  --heat-1: rgba(255,95,109,.16);
+  --heat-2: rgba(255,95,109,.32);  --heat-3: rgba(255,95,109,.58);
+  --heat-4: rgba(255,95,109,.88);
+
+  --drawer-bg:            #0D0F1C;
+  --drawer-border:        rgba(255, 255, 255, .10);
+  --drawer-shadow:        -12px 0 40px rgba(0, 0, 0, .55);
+  --drawer-scrim:         rgba(7, 8, 15, .55);
+  --kpi-tile-bg:          #13162A;
+  --callout-bg:           rgba(255, 179, 71, .08);
+  --callout-border:       rgba(255, 179, 71, .35);
+  --handle-bg:            #9B6DFF;
+  --handle-text:          #FFFFFF;
+}
+```
+
+USAGE RULES:
+  - Verdict phrase color = --verdict-bad / --verdict-good chosen by POLARITY
+    (Section 3.3), never by numeric sign.
+  - Bars: full-strength color for the #1 ranked item, -soft for the rest.
+  - Heatmap uses ONLY the 5-step ramp; map cell value quantiles to steps.
+  - Fonts: body sentences DM Sans; all numeric values DM Mono; the plain-
+    terms card body is 14.5–15px / 1.65 line-height (READING typography —
+    larger than the 12–13px UI text around it).
+
+
+--------------------------------------------------------------------------------
+3. THE NARRATIVE ENGINE  (lib/interpret/)
+--------------------------------------------------------------------------------
+3.1 INPUT (client-side, from state already loaded for the chart)
+```typescript
+interface InterpretInput {
+  signalId: string;
+  observed: { week: string; value: number }[];   // z-scored series
+  forecast: { week: string; p10: number; p50: number; p90: number }[];
+  driverWeights: { featureId: string; weight: number }[];
+  weeksObserved: number;
+  minWeeksRequired: number;                       // CFG.MIN_WEEKS_REQUIRED
+  calibration?: { coverage: number; window: number };  // from monitoring
+  driftAlarm?: boolean;                           // DriftReport status=alarm
+}
+```
+
+3.2 DISPLAY-NAME REGISTRY  (lib/interpret/registry.ts)
+Raw feature ids NEVER reach the DOM. One registry maps id → label, and
+groups seasonality pairs into one concept:
+```typescript
+export const FEATURE_LABELS: Record<string, string> = {
+  after_hours_ratio: "after-hours work patterns",
+  weekend_ratio:     "weekend work",
+  n_prs_opened:      "PRs opened",
+  median_cycle_time: "task cycle time",
+  sentiment_std:     "mood swings in messages",
+  sentiment_mean:    "overall message tone",
+  actor_entropy:     "how work is spread across people",
+  topic_drift:       "shift in what the team discusses",
+  n_messages:        "message volume",
+  observed:          "data availability",
+};
+export const MERGE_GROUPS = [
+  { ids: ["week_sin", "week_cos"], label: "seasonal timing" },
+];
+// merge rule: sum |weights| of group members into one entry.
+```
+
+3.3 POLARITY REGISTRY  (which direction is BAD, per signal)
+```typescript
+export const POLARITY: Record<string, "up_bad" | "up_good"> = {
+  burnout_risk:      "up_bad",
+  review_latency:    "up_bad",
+  bus_factor:        "up_good",
+  delivery_velocity: "up_good",
+  knowledge_spread:  "up_good",
+};
+```
+Verdict color, bar color, and "improving/worsening" wording ALL derive from
+polarity + direction. A rising good metric is teal; a rising bad one coral.
+
+3.4 THRESHOLD TABLES  (lib/interpret/thresholds.ts)
+Magnitude of projected move Δ = p50[horizon] − observed[last]:
+  |Δ| < 0.25         "holding steady"
+  0.25 ≤ |Δ| < 0.75  "drifting {up|down}"
+  0.75 ≤ |Δ| < 1.5   "clearly {rising|falling}"
+  |Δ| ≥ 1.5          "moving sharply {up|down}"
+
+Plain magnitude (the human-units phrase):
+  |Δ| < 0.25         "about level with its normal"
+  0.25–0.75          "slightly {above|below} its normal"
+  0.75–1.5           "about one {tough|strong} week {above|below} its normal"
+                      (tough for up_bad, strong for up_good)
+  ≥ 1.5              "well beyond anything in its recent history"
+
+Band width W = p90[horizon] − p10[horizon]:
+  W < 1.0            "the model is fairly confident in this range"
+  1.0 ≤ W < 2.0      "that's a wide range — read this as a direction,
+                      not a promise"
+  W ≥ 2.0            "highly uncertain — directional only"
+
+Momentum (weekly deltas of observed, last 6):
+  ≥3 consecutive same-direction deltas with growing |delta| →
+      "{n} straight weeks of {rising|easing} pressure — speeding up"
+  ≥3 consecutive same-direction, flat magnitude → "…— steady trend"
+  else → omit momentum sentence.
+
+3.5 NEAREST-WEEK ANCHOR  (the lived-history comparison)
+```typescript
+function nearestWeek(observed, target: number) {
+  let best = null, bestDist = Infinity;
+  for (const o of observed) {
+    const d = Math.abs(o.value - target);
+    if (d < bestDist) { bestDist = d; best = o; }
+  }
+  // only anchor if genuinely similar; else omit the clause
+  return bestDist <= 0.35 ? best : null;
+}
+// target = p50 at horizon. Label: "the week of {Mon d}" (e.g. "Jul 6").
+```
+
+3.6 SENTENCE SKELETON  (always this order; conditional slots omitted cleanly)
+  S1 VERDICT   : "{Signal label} is {magnitude phrase}."
+  S2 ANCHOR    : "By {horizon month}, the model expects this team to sit
+                  {plain magnitude} — similar to {anchor chip}."
+                  (anchor clause omitted if nearestWeek returns null)
+  S3 RANGE     : "Realistically it could land anywhere from {bear plain}
+                  to {bull plain} — {band phrase}."
+  S4 CAVEAT    : if weeksObserved < minWeeksRequired:
+                  "With only {n} weeks of history, treat this as an
+                  early read."
+                 if driftAlarm:
+                  "This forecast is running on a stale model and is being
+                  retrained — treat with extra caution."
+  S5 WATCH     : from top driver + momentum: "Watch: {k} more weeks of
+                  {top driver label} {rising|falling} turns this into a
+                  {trend|recovery}."
+  BUDGET: ≤ 60 words for S1–S3. One colored phrase only (the verdict).
+
+3.7 OUTPUT
+```typescript
+interface Narrative {
+  verdict: { text: string; tone: "bad" | "good" | "neutral" };
+  sentences: string[];                    // S2..S5 resolved
+  anchor?: { weekISO: string; label: string };
+  drivers: { label: string; weight: number; direction: "up"|"down";
+             helps: boolean; sentence: string }[];   // per-driver S for drawer
+  kpis: { projectedMove: string; movePlain: string;
+          range: string; rangePlain: string;
+          history: string; historyPlain: string;
+          accuracy?: string; accuracyPlain?: string };
+}
+```
+Per-driver sentence template: "{Label} has {risen|fallen} {n} weeks
+straight — the strongest push behind this forecast." (rank-aware wording:
+strongest / a secondary / a minor push; "helps" drivers get "…pulling the
+risk back down.")
+
+
+--------------------------------------------------------------------------------
+4. PLAIN-TERMS CARD  (rail, TOP position — above Scenarios)
+--------------------------------------------------------------------------------
+  - Rail order becomes: PlainTermsCard → Scenarios → Drivers → footnote-ⓘ.
+    The old grey explainer paragraph is REMOVED and folded into an ⓘ
+    tooltip on this card's header.
+  - Card chrome: 2px solid var(--interp-hero-border), var(--interp-hero-
+    shadow). It is the rail's ONLY hero-bordered card.
+  - Header: "IN PLAIN TERMS" (11px, letterspaced, --accent) + live badge
+    "● synced with chart" (10.5px DM Mono, --teal).
+  - Body: the S1–S4 sentences, 14.5px/1.65. Verdict phrase is the only
+    bold+colored text (--verdict-bad|good).
+  - Anchor chip: --anchor-chip-bg/-text, radius 6px, cursor pointer,
+    participates in cross-highlighting (Section 5).
+  - Driver chips row: top 3 driver labels in --bg-inset pills.
+  - Footer: eye icon + S5 watch line, top border var(--border).
+  - "Full breakdown →" link bottom-right → opens drawer.
+  - Signal switch: 250ms crossfade synchronized with the chart.
+  - Poll update that changes any threshold band: background tint pulse
+    (--accent at 8%, 600ms) once.
+  - Empty state (signal without data): "Once this source is connected,
+    I'll explain what the numbers mean here."
+
+
+--------------------------------------------------------------------------------
+5. CROSS-HIGHLIGHTING  (the narrative controls the chart)
+--------------------------------------------------------------------------------
+Store (zustand, shared with chart + drivers + drawer):
+```typescript
+interface HighlightState {
+  highlight: null
+    | { type: "week";     weekISO: string }
+    | { type: "quantile"; q: 0.1 | 0.5 | 0.9 }
+    | { type: "driver";   label: string };
+  setHighlight(h: HighlightState["highlight"]): void;  // null on mouseleave
+}
+```
+Bindings:
+  - Anchor chip hover  → {type:"week"}: chart renders a ring marker + date
+    flag on that observed point (accent, 600ms fade-in).
+  - "best case"/"worst case" words in S3 are spans → {type:"quantile"}:
+    chart flashes the P90/P10 band edge to 2px full-opacity.
+  - Driver chip hover  → {type:"driver"}: that bar in the drivers panel
+    scales its fill brightness up 15% and shows its value label.
+  - All flashes revert 250ms after highlight → null.
+  - Touch devices: tap toggles the same highlight; second tap clears.
+
+
+--------------------------------------------------------------------------------
+6. SIGNAL RANKING BARS  (main column, ABOVE the hero card)
+--------------------------------------------------------------------------------
+The portfolio answer to "which signal needs attention" before any drilling.
+  - Card title "WHICH SIGNALS NEED ATTENTION" + sub "Projected 13-week
+    moves, ranked. {Right|coral} of the line = worsening."
+  - Diverging horizontal bars from a zero line (--bar-zeroline, 1px):
+    worsening grows right in --bar-worsening (rank #1 full, rest -soft),
+    improving grows left in --bar-improving(-soft).
+  - Sort: worst polarity-adjusted move first. Cap 6 rows; "N more →"
+    expands. Rows are clickable → selects that signal everywhere.
+  - Value label at bar end, DM Mono 11px, colored by polarity direction.
+    Good-direction positive values append " ✓" (e.g. "+0.37σ ✓").
+  - Signals with no data are excluded (not zero-length bars).
+  - Footer sentence from the engine: "{Top signal} is the outlier —
+    everything else is {drifting|steady}, this one is moving."
+  - Bars animate width 0→W on mount, 500ms ease-out, 60ms stagger.
+
+
+--------------------------------------------------------------------------------
+7. EXPLAIN DRAWER
+--------------------------------------------------------------------------------
+7.1 HANDLE (trigger)
+  - Fixed to the right edge of the forecast content area, vertically
+    centered on the chart card: vertical tab "EXPLAIN" (10.5px, letter-
+    spaced, --handle-bg/--handle-text, radius 8px 0 0 8px) + 14px dot.
+  - PULSE IS FINITE AND MEANINGFUL: the dot pulses 3 cycles (2.2s each,
+    scale 2.2 fade) ONLY when: verdict band changed since last open,
+    driftAlarm became true, or the top driver changed. Then static.
+    Unseen-change state keeps a solid dot badge until the drawer opens.
+  - Never pulses in sync competition with chart endpoint dots: if the
+    chart draw-in is running, delay handle pulse until it finishes.
+
+7.2 MECHANICS
+  - Built on Base UI Dialog (NOT Radix/vaul). data-open drives transform.
+  - Panel: width clamp(480px, 36vw, 560px); height 100% of content area;
+    bg var(--drawer-bg); left border var(--drawer-border); shadow
+    var(--drawer-shadow); slides translateX(100%)→0, 280ms
+    cubic-bezier(.32,.72,.24,1).
+  - Scrim: var(--drawer-scrim) + backdrop-filter blur(2px) below 1600px
+    viewport; ≥1600px scrim optional (overlay stays — never push layout).
+  - Close: ✕ button, ESC, scrim click, handle re-click, swipe-right ≥ 60px
+    on touch. Focus trap while open; focus returns to the handle on close.
+  - Deep link: ?panel=explain&signal={id} (open on load if present; keep
+    URL in sync via replaceState).
+  - Stays mounted while open; re-binds with 250ms crossfade on signal
+    switch in the list beneath.
+
+7.3 CONTENTS (top to bottom — every section DEEPENS, never repeats rail)
+  a) Header: "FORECAST EXPLAINED" kicker + "{Signal} · next 13 weeks" + ✕.
+  b) KPI STRIP: 2×2 tiles (--kpi-tile-bg, radius 8px):
+       PROJECTED MOVE  {+0.88σ}   sub: {magnitude phrase}
+       RANGE           {1.36σ}    sub: {band phrase, short}
+       HISTORY         {11w}      sub: "still learning" | "well observed"
+       PAST ACCURACY   {78%}      sub: "lands in band" (from calibration;
+                                  tile omitted if no elapsed forecasts yet)
+     Values DM Mono 13px; move tile colored by polarity direction;
+     history tile --amber when below minWeeksRequired.
+  c) DRIVER BARS (expanded): signed horizontal bars, zero line, polarity
+     colors, value labels; UNDER EACH BAR its per-driver sentence
+     (Narrative.drivers[].sentence, 10.5px --text-secondary). Cap 5.
+  d) SCENARIO RANGE: horizontal band Bear→Bull with three markers; each
+     marker labeled with σ (Mono) AND its nearest-week anchor phrase when
+     available ("Bear -0.82σ · like the quiet week of Jun 15").
+  e) MOMENTUM BARS: last 10 weekly deltas as vertical bars on a baseline;
+     color per-bar by polarity direction (-soft ramp toward full for the
+     latest). Sentence beneath from the momentum threshold.
+  f) TRACK RECORD BARS: last ≤12 elapsed forecast weeks as equal-height
+     cells: in-band --bar-improving-soft, missed --bar-worsening-soft.
+     Right label "{hits} of {n} in range". Sentence: "When this model
+     gives a range, reality usually lands inside it." (only if coverage
+     ≥ .6; below that: "Recent forecasts have been missing — the model
+     is being retrained." )
+  g) AFTER-HOURS HEATMAP (burnout_risk drawer only): weekday × time-band
+     grid (Mon–Fri × 18-21 / 21-24 / Sat-Sun row), cells from the 5-step
+     --heat ramp. Labeled "(observed)" — computed from RAW EVENT
+     TIMESTAMPS over the trailing 8 weeks, NOT from the weekly model:
+       SELECT day-of-week, time-band, count(*) FROM events
+       WHERE tenant scope AND after-hours AND ts > now()-8w GROUP BY 1,2;
+     served by GET /api/forecasts/interpret/heatmap?signal=burnout_risk.
+     Hover cell → count tooltip. Sentence beneath names the hotspot:
+     "{Weekday} {band} is this team's late-work hotspot."
+  h) EXPLAINER CALLOUT: --callout-bg/-border, radius 8px: two sentences,
+     static template, explaining how to read the panel + the S4 caveat
+     if active.
+
+7.4 DRAWER DATA API
+  GET /api/forecasts/interpret/{signalId}
+    → { calibration: {coverage, window, hits: boolean[]},
+        momentum: number[],            // weekly deltas (server-computed ok)
+        heatmap?: {cells: number[][], labels: {...}} }
+  Tenant-scoped, cached 60s. Everything else the drawer needs is already
+  client-side. The narrative itself is NEVER served — always computed.
+
+
+--------------------------------------------------------------------------------
+8. BAR CHART DESIGN RULES (apply to Sections 6 and 7c/e/f)
+--------------------------------------------------------------------------------
+  - Bars decompose, compare, or rank. NEVER re-plot the level time series
+    as bars — the fan owns level; momentum bars own change.
+  - Diverging-from-zero for anything signed. Color by POLARITY, not sign.
+  - Horizontal for comparisons (labels read naturally); vertical for time.
+  - Value labels at bar ends in DM Mono. No gridlines on bar charts.
+  - Cap 5–7 bars, ranked, worst/strongest first; collapse the rest.
+  - Every bar group ends with ONE engine-generated sentence. A bar chart
+    without its sentence does not ship.
+  - Mount animation: width/height 0→value, 500ms ease-out, 60ms stagger.
+  - Track color --bar-track behind horizontal bars.
+
+
+--------------------------------------------------------------------------------
+9. SIGNAL ROW ONE-LINERS + SIGMA TOOLTIPS (small touches, same engine)
+--------------------------------------------------------------------------------
+  - Under each signal row's σ value in the Signals list: a one-line micro
+    summary, 10.5px --text-muted: "{magnitude phrase} · {plain magnitude,
+    shortened}". Computed from the same engine (S1 fragments).
+  - EVERY σ value anywhere on the page gets a title/tooltip:
+    "{value}σ ≈ {plain magnitude phrase} for this team". One shared
+    <SigmaValue value={x} signalId={id}/> component enforces this.
+
+
+--------------------------------------------------------------------------------
+10. MOTION + REDUCED MOTION
+--------------------------------------------------------------------------------
+  - Allowed animations: drawer slide, bar mount growth, card crossfades,
+    tint pulse, handle finite pulse, cross-highlight flashes. All
+    transform/opacity only.
+  - prefers-reduced-motion: drawer appears without slide (opacity 150ms),
+    bars render at full width instantly, no pulses, no tint flash;
+    cross-highlight still works but as instant style swap. Content and
+    meaning identical.
+
+
+--------------------------------------------------------------------------------
+11. FOLDER STRUCTURE
+--------------------------------------------------------------------------------
+lib/interpret/
+├── registry.ts            # FEATURE_LABELS, MERGE_GROUPS, POLARITY
+├── thresholds.ts          # all tables from 3.4
+├── anchor.ts              # nearestWeek
+├── narrative.ts           # buildNarrative(input): Narrative  (pure)
+└── __tests__/narrative.test.ts
+
+app/forecasts/interpret/
+├── PlainTermsCard.tsx
+├── SignalRankingBars.tsx
+├── ExplainHandle.tsx
+├── ExplainDrawer.tsx
+├── drawer/
+│   ├── KpiStrip.tsx
+│   ├── DriverBars.tsx
+│   ├── ScenarioRange.tsx
+│   ├── MomentumBars.tsx
+│   ├── TrackRecordBars.tsx
+│   ├── AfterHoursHeatmap.tsx
+│   └── ExplainerCallout.tsx
+├── SigmaValue.tsx
+└── useHighlight.ts        # zustand store (Section 5)
+
+app/api/forecasts/interpret/
+├── [signalId]/route.ts    # calibration + momentum + heatmap payload
+└── heatmap query in lib/forecasts/heatmap.ts
+
+
+--------------------------------------------------------------------------------
+12. TESTS + ACCEPTANCE CHECKLIST
+--------------------------------------------------------------------------------
+UNIT (narrative engine — these are the important ones):
+  [ ] Same input twice → byte-identical Narrative (determinism)
+  [ ] Each magnitude/band/momentum threshold boundary maps to the exact
+      phrase (test at 0.24/0.25/0.749/0.75/1.49/1.5 etc.)
+  [ ] Polarity: rising up_good metric → "good" tone + improving wording
+  [ ] week_sin + week_cos merge into one "seasonal timing" driver
+  [ ] No raw feature id ever appears in any output string
+  [ ] Anchor omitted when nearest distance > 0.35
+  [ ] Caveats: cold-start fires below minWeeksRequired; drift text on alarm
+  [ ] Word budget: S1–S3 ≤ 60 words for all template combinations
+
+UI:
+  [ ] Rail order: PlainTerms → Scenarios → Drivers; old grey footnote gone
+  [ ] Both themes pure-token; verdict/bars/heatmap/drawer correct in each
+  [ ] Cross-highlight: chip→week ring, case words→band flash, driver→bar
+  [ ] Ranking bars diverge from zero, polarity-colored, rows select signal
+  [ ] Handle pulse fires only on change events, 3 cycles, then static
+  [ ] Drawer: Base UI Dialog, sizes/transition per 7.2, ESC/scrim/swipe
+      close, focus trap + return, deep link works both directions
+  [ ] Drawer sections deepen (per-driver sentences, accuracy, heatmap) —
+      nothing is a duplicate of the rail card
+  [ ] Heatmap labeled (observed), served from events, burnout only
+  [ ] Signal-row one-liners + SigmaValue tooltips everywhere
+  [ ] Reduced-motion variant complete per Section 10
+
+================================================================================
+END OF INTERPRETATION LAYER SPECIFICATION
+================================================================================

@@ -1,0 +1,319 @@
+================================================================================
+COBRAIN — FORECASTS UI DESIGN SPECIFICATION
+DUAL-THEME (LIGHT + DARK) · KALSHI-GRADE CHART · LIVE PULSE ANIMATION
+================================================================================
+Document type : UI build specification for the engineering agent
+Applies to    : app/forecasts/* (the Forecasts page and ForecastCard component)
+Relation      : Extends the current implemented Forecasts page (screenshot
+                reference: light mode, lavender fan, signals list, drivers
+                panel). Nothing is thrown away — this upgrades it.
+Design intent : "Prediction-market grade." Thick confident lines, live pulsing
+                endpoints, honest uncertainty bands. The chart should make
+                people go "whoa" in the first second, then reward reading.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. AGENT — READ THIS FIRST
+--------------------------------------------------------------------------------
+Rules:
+  - Implement BOTH themes from the token tables in Section 1. Never hardcode a
+    color in a component — every color goes through a CSS variable.
+  - Theme switching is `data-theme="light" | "dark"` on <html>. Default follows
+    prefers-color-scheme; user override persists in localStorage.
+  - All chart strokes, radii, and animation timings are EXACT values. Do not
+    substitute.
+  - Respect prefers-reduced-motion everywhere (Section 6.5).
+  - Fonts: Syne (display numbers + headings), DM Sans (UI), DM Mono (all
+    numeric/sigma/data values). Already in the design system — reuse.
+
+
+--------------------------------------------------------------------------------
+1. THE DUAL-THEME TOKEN SYSTEM
+--------------------------------------------------------------------------------
+One semantic token vocabulary, two value sets. Components reference ONLY the
+semantic names.
+
+1.1 CSS VARIABLES (globals.css)
+```css
+:root, [data-theme="light"] {
+  /* surfaces */
+  --bg-page:        #F7F8FB;
+  --bg-card:        #FFFFFF;
+  --bg-inset:       #F1F3F8;   /* signal rows, chips, scenario rows */
+  --bg-selected:    #EEEDFB;   /* selected signal row / Base scenario */
+  --border:         rgba(15, 23, 42, 0.08);
+  --border-strong:  rgba(15, 23, 42, 0.14);
+
+  /* text */
+  --text-primary:   #0F172A;
+  --text-secondary: #55607A;
+  --text-muted:     #8B94A8;
+
+  /* brand + semantics */
+  --accent:         #6D5EF0;   /* primary purple — forecast, actions */
+  --accent-soft:    rgba(109, 94, 240, 0.14);
+  --teal:           #0FA88C;   /* healthy / improving */
+  --coral:          #E0483F;   /* risk / worsening */
+  --amber:          #D98A0B;   /* caution / low confidence */
+  --ice:            #4C7DD8;   /* observed history, informational */
+
+  /* chart */
+  --chart-observed:      #9AA3B5;
+  --chart-observed-dot:  #6B7488;
+  --chart-p50:           #6D5EF0;
+  --chart-band:          rgba(109, 94, 240, 0.16);
+  --chart-band-edge:     rgba(109, 94, 240, 0.34);
+  --chart-grid:          rgba(15, 23, 42, 0.06);
+  --chart-divider:       rgba(15, 23, 42, 0.28);
+  --chart-crosshair:     rgba(15, 23, 42, 0.35);
+  --pulse-core:          #6D5EF0;
+  --pulse-halo:          rgba(109, 94, 240, 0.35);
+}
+
+[data-theme="dark"] {
+  /* surfaces — Depth Intelligence */
+  --bg-page:        #07080F;
+  --bg-card:        #0D0F1C;
+  --bg-inset:       #13162A;
+  --bg-selected:    #1A1D3A;
+  --border:         rgba(255, 255, 255, 0.07);
+  --border-strong:  rgba(255, 255, 255, 0.13);
+
+  --text-primary:   #F4F6FF;
+  --text-secondary: #9CA3AF;
+  --text-muted:     #6B7280;
+
+  --accent:         #9B6DFF;
+  --accent-soft:    rgba(155, 109, 255, 0.16);
+  --teal:           #00E5CC;
+  --coral:          #FF5F6D;
+  --amber:          #FFB347;
+  --ice:            #A8C8FF;
+
+  --chart-observed:      #55607A;
+  --chart-observed-dot:  #8B94A8;
+  --chart-p50:           #9B6DFF;
+  --chart-band:          rgba(155, 109, 255, 0.18);
+  --chart-band-edge:     rgba(155, 109, 255, 0.42);
+  --chart-grid:          rgba(255, 255, 255, 0.05);
+  --chart-divider:       rgba(255, 255, 255, 0.30);
+  --chart-crosshair:     rgba(255, 255, 255, 0.35);
+  --pulse-core:          #9B6DFF;
+  --pulse-halo:          rgba(155, 109, 255, 0.40);
+}
+```
+
+1.2 SEMANTIC USAGE RULES
+  - --accent owns: P50 line, fan band, Write to Brain button, selected states,
+    driver bars. ONE accent per view — everything else is neutral.
+  - --coral appears ONLY on worsening deltas (+0.88σ on a risk metric) and
+    risk badges. --teal ONLY on improving deltas. Never decorative.
+  - --amber ONLY for the Low-confidence badge and cold-start warnings.
+  - Sigma values, week counts, band ranges: ALWAYS DM Mono.
+  - Big display numbers (+0.88σ): Syne 700, mono-spaced digits via
+    font-feature-settings: "tnum".
+
+
+--------------------------------------------------------------------------------
+2. PAGE ANATOMY (keep current layout, upgrade each region)
+--------------------------------------------------------------------------------
+  ┌──────────────────────────────────────────────┬───────────────────┐
+  │ A. Forecast hero card                        │ C. Scenarios panel│
+  │    header · headline number · badges         │    Bull/Base/Bear │
+  │    B. THE CHART (the star)                   │    Write to Brain │
+  │                                              ├───────────────────┤
+  ├──────────────────────────────────────────────┤ D. Drivers panel  │
+  │ E. Signals list (selectable rows)            │    "What drove    │
+  │                                              │     this"         │
+  └──────────────────────────────────────────────┴───────────────────┘
+  Grid: 1fr 360px · gap 20px · page max-width 1440px · card radius 16px
+  Card: background var(--bg-card); border 1px var(--border);
+        box-shadow none (dark) / 0 1px 3px rgba(15,23,42,.05) (light)
+
+
+--------------------------------------------------------------------------------
+3. THE CHART — KALSHI-GRADE SPEC (region B)
+--------------------------------------------------------------------------------
+This is where "whoa" happens. Exact rendering spec:
+
+3.1 GEOMETRY
+  Height: 340px desktop, 260px mobile. Margins: t 16 · r 56 · b 28 · l 8.
+  Y-axis labels on the RIGHT (Kalshi-style), DM Mono 11px var(--text-muted),
+  suffix σ. Gridlines: 1px dashed 3/5, var(--chart-grid), horizontal only.
+  X-axis: week labels every ~4th tick, DM Mono 11px.
+
+3.2 LINE WEIGHTS — THE THICK-LINE RULE
+  Observed history line : strokeWidth 3   · var(--chart-observed)
+                          strokeLinecap "round" · strokeLinejoin "round"
+  P50 forecast line     : strokeWidth 3.5 · var(--chart-p50)
+                          dash "1 0" solid up to today; the FORECAST segment
+                          uses strokeDasharray "10 7" (long confident dashes,
+                          not fine dots)
+  Band edges (P10/P90)  : strokeWidth 1.5 · var(--chart-band-edge)
+  Fan fill              : var(--chart-band), NO gradient fade — flat, honest
+  Today divider         : strokeWidth 1.5 dashed "4 4" var(--chart-divider),
+                          label "forecast →" 11px DM Mono above it
+  RATIONALE: Kalshi lines read at 2.5–3px. Thin 1–1.5px lines look academic;
+  3px+ with round caps looks like conviction. Never go below 3 on data lines.
+
+3.3 THE LIVE PULSE DOT (the "blinking" endpoints)
+  Placement: (a) last observed point, (b) forecast endpoint at horizon.
+  Structure per dot — three concentric SVG circles:
+    <g class="pulse-dot">
+      <circle class="pulse-ring"  r="6"  fill="none"
+              stroke="var(--pulse-halo)" stroke-width="2"/>
+      <circle class="pulse-glow"  r="10" fill="var(--pulse-halo)"/>
+      <circle class="pulse-core"  r="4.5" fill="var(--pulse-core)"
+              stroke="var(--bg-card)" stroke-width="2"/>
+    </g>
+
+  Animation — "pop out then settle", 2.4s loop, staggered:
+```css
+@keyframes pulseRing {
+  0%   { transform: scale(1);    opacity: 0.9; }
+  35%  { transform: scale(2.6);  opacity: 0;   }
+  100% { transform: scale(2.6);  opacity: 0;   }
+}
+@keyframes pulseCore {
+  0%, 100% { transform: scale(1); }
+  12%      { transform: scale(1.35); }   /* the pop */
+  24%      { transform: scale(1); }      /* settle back */
+}
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.25; }
+  12%      { opacity: 0.55; }
+}
+.pulse-ring { animation: pulseRing 2.4s cubic-bezier(.25,.6,.3,1) infinite;
+              transform-origin: center; transform-box: fill-box; }
+.pulse-core { animation: pulseCore 2.4s cubic-bezier(.34,1.56,.64,1) infinite;
+              transform-origin: center; transform-box: fill-box; }
+.pulse-glow { animation: pulseGlow 2.4s ease-in-out infinite; }
+.pulse-dot--forecast * { animation-delay: 1.2s; }  /* stagger the two dots */
+```
+  The overshoot bezier (.34,1.56,.64,1) is what makes the core POP past 1.0
+  and snap back — that's the blink feel. transform-box: fill-box is REQUIRED
+  or SVG scales from the canvas origin and the dot flies away.
+
+  Recharts wiring: render via <Customized/> or the `dot` prop returning this
+  <g> only when payload.isLast / payload.isHorizon. activeDot stays default.
+
+3.4 HOVER INTERACTION
+  - Vertical crosshair: 1px solid var(--chart-crosshair), full height,
+    follows cursor snapped to week.
+  - Tooltip card: bg var(--bg-card), border 1px var(--border-strong),
+    radius 10px, shadow 0 8px 24px rgba(0,0,0,.18); rows: week (Mono 11
+    muted), then Observed OR P90/P50/P10 each with a 8px color swatch and
+    DM Mono values. P50 row bold.
+  - Hovering the fan region also lifts band opacity from .16 → .24 (120ms).
+
+3.5 NUMBER TICKER (headline +0.88σ)
+  On mount and on value change, the big number counts from previous → new
+  over 600ms ease-out, DM-Mono tabular digits. Color: coral if worsening,
+  teal if improving (direction-aware per metric — for risk metrics UP=coral).
+
+
+--------------------------------------------------------------------------------
+4. PANELS C, D, E — UPGRADED SPECS
+--------------------------------------------------------------------------------
+4.1 SCENARIOS AT HORIZON (C)
+  Three rows (Bull P90 / Base P50 / Bear P10), 44px tall, radius 10px.
+  Base row: bg var(--bg-selected), 1px var(--accent) at 25% border.
+  Values right-aligned DM Mono 15px. Row hover: translateX(2px), 120ms.
+  WRITE TO BRAIN button: full width, 46px, radius 12px, bg var(--accent),
+  white text DM Sans 600 14px; hover: brightness(1.08) + translateY(-1px);
+  active: scale(.98). After success: morphs to "✓ Written to Brain" teal bg
+  for 1.8s, then reverts. (Wire to the BrainBlock dual-write.)
+
+4.2 WHAT DROVE THIS (D) — driver bars
+  Each row: label (DM Sans 13 var(--text-secondary)) + track.
+  Track: 6px tall, radius 3px, bg var(--bg-inset).
+  Fill: var(--accent), width = |weight| normalised to max; animates 0 → W
+  on panel mount, 500ms ease-out, stagger 60ms per row (top to bottom).
+  Sign matters: negative-direction drivers get a 4px coral left edge on the
+  label; positive get teal. Tooltip on hover shows raw weight (Mono).
+  Source: variable-selection weights from the interpretability head.
+
+4.3 SIGNALS LIST (E)
+  Row: 72px, radius 12px, 12px gap. Selected row: bg var(--bg-selected) +
+  2px var(--accent) left border (radius 0 on that edge).
+  Each row: icon chip 40px (bg = metric color at 12% opacity, icon at full),
+  name DM Sans 600 14, "11w observed" Mono 11 muted, SPARKLINE 120×36
+  (strokeWidth 2, observed solid + forecast dashed, no dots, no axes),
+  band range Mono 11, delta chip (Syne 700 15, coral/teal by direction).
+  "no data yet" rows: 55% opacity, italic hint, NOT clickable.
+  Row click → chart + scenarios + drivers all re-bind to that signal with a
+  250ms crossfade (opacity 1→0→1 on the chart group; no layout shift).
+
+4.4 BADGES
+  Low confidence: 1px var(--amber) border, amber text, bg amber at 10%,
+  radius 999px, 12px Mono. Tooltip: "Only 11 of 12 minimum weeks observed —
+  bands are widened." (ties to CFG.MIN_WEEKS_REQUIRED).
+  Meta row (11w observed · 13w horizon · 1.36σ band): DM Mono 12, dot
+  separators var(--text-muted).
+
+
+--------------------------------------------------------------------------------
+5. THEME SWITCHING
+--------------------------------------------------------------------------------
+  - <html data-theme> set pre-hydration via inline script reading
+    localStorage("cb-theme") || matchMedia — prevents flash.
+  - Toggle in the top nav: sun/moon, 200ms crossfade on --bg-page only;
+    all other properties switch instantly (transitioning every color var
+    causes chart repaint jank).
+  - Recharts reads colors from CSS vars via getComputedStyle once per theme
+    change (store in a useTheme() hook returning the resolved palette), NOT
+    hardcoded hex in chart config.
+
+
+--------------------------------------------------------------------------------
+6. MOTION SYSTEM (summary)
+--------------------------------------------------------------------------------
+  6.1 Chart line draw-in on mount/signal-switch: pathLength trick,
+      stroke-dashoffset animated 1→0, observed 600ms then forecast 450ms
+      (sequenced), ease-out. Fan fades in 300ms AFTER lines finish.
+  6.2 Pulse dots: Section 3.3, start only after draw-in completes.
+  6.3 Driver bars: staggered fill (4.2).
+  6.4 Number ticker: 600ms (3.5).
+  6.5 prefers-reduced-motion: reduce → NO pulse loop (static dot with halo
+      at 0.3 opacity), no draw-in (lines appear), no ticker (value swaps),
+      keep 120ms hovers. Non-negotiable.
+  6.6 Nothing else animates. No floating orbs on this page — the data is
+      the show.
+
+
+--------------------------------------------------------------------------------
+7. IMPLEMENTATION NOTES (Recharts)
+--------------------------------------------------------------------------------
+  - One <ComposedChart>: Area (dataKey band = [p10,p90]) under two Lines.
+  - Split series at today: observed null after, p50/p10/p90 null before,
+    duplicate the boundary point in both so lines visually hand off.
+  - Custom dot renderer: return null except isLast/isHorizon → pulse <g>.
+  - Y domain: nice-round σ ticks (…, -0.9, 0, +0.9, +1.8, +2.7) — compute
+    from data max, snap to 0.9 multiples to echo the current design.
+  - Axis/tooltip/label fonts via the resolved theme palette hook (5).
+  - Export the card as ForecastCard({ signalId, mode }) — the signals list
+    (E) drives it; scenarios (C) and drivers (D) subscribe to the same
+    selected-signal store (zustand or context).
+
+
+--------------------------------------------------------------------------------
+8. ACCEPTANCE CHECKLIST
+--------------------------------------------------------------------------------
+  [ ] Both themes render from tokens only; zero hardcoded colors in TSX
+  [ ] No-flash theme boot; toggle persists
+  [ ] Data lines ≥3px, round caps; forecast dash 10/7; flat band fill
+  [ ] Pulse dots on last-observed + horizon, staggered 1.2s, overshoot pop
+  [ ] transform-box: fill-box present (dots must not orbit the canvas)
+  [ ] Draw-in sequence: observed → forecast → fan → pulses
+  [ ] Crosshair + themed tooltip with P90/P50/P10 rows
+  [ ] Number ticker with tabular digits, direction-aware color
+  [ ] Driver bars staggered, signed edges, weights from interpretability head
+  [ ] Signal row switch crossfades chart, scenarios, drivers together
+  [ ] Write to Brain success morph wired to BrainBlock dual-write
+  [ ] Low-confidence badge tied to MIN_WEEKS_REQUIRED with tooltip
+  [ ] prefers-reduced-motion honored exactly per 6.5
+
+================================================================================
+END OF FORECAST UI DESIGN SPECIFICATION
+================================================================================

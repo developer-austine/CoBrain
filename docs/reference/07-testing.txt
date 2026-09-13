@@ -1,0 +1,87 @@
+# 07 · Testing
+
+```bash
+pnpm test          # vitest run — everything (127 tests)
+pnpm vitest run lib/chat            # one area
+pnpm exec tsc --noEmit              # typecheck
+```
+
+## The three layers
+
+```mermaid
+flowchart TB
+    U["Unit — pure modules, no I/O<br/>runs in ms, always"]
+    I["Integration — real Qdrant + Postgres<br/>skips if the stack is down"]
+    E["System E2E — every layer wired<br/>skips if the stack is down"]
+    U --> I --> E
+```
+
+Integration and E2E tests **self-skip** when the stack is unreachable, so
+`pnpm test` stays green on a cold machine. Bring the stack up to actually
+exercise them:
+
+```bash
+cd backend && docker compose up -d
+```
+
+## What's covered
+
+| File | Layer | Guards |
+|------|-------|--------|
+| `lib/chat/__tests__/sourceIntent.test.ts` | unit | Keyword → source. "di**git**al" must not trigger GitHub; email only when asked. |
+| `lib/chat/__tests__/documents.test.ts` | unit | **Chunk → document regrouping.** Explicitly asserts 5 email chunks collapse to 1 doc so 3 Notion pages survive. |
+| `lib/interactive/__tests__/sourceScope.test.ts` | unit | @-mention precedence. **`@brain` on a WRITE is the destination, not the search scope.** |
+| `lib/workflow/__tests__/knowledgeScope.test.ts` | unit | Transitive knowledge flow; **cycle refusal** (direct + transitive); diamonds allowed. |
+| `lib/sources/__tests__/constants.test.ts` | unit | Upload validation (type, size, empty). |
+| `lib/hooks/__tests__/useTypewriter.test.ts` | unit | Growing speech partials must not restart the animation; a revision must. |
+| `lib/chat/__tests__/format.test.ts`, `interactive/`, `onboarding/`, `pricing/`, `connector/` | unit | Formatting, intent, gating, plans, pipeline factory. |
+| `lib/chat/__tests__/retrieval.integration.test.ts` | integration | Live: a `@notion` query returns **multiple distinct** Notion docs, no email; context numbering matches citations. |
+| `lib/__tests__/system.e2e.test.ts` | **E2E** | Postgres · Redis · MinIO · **Qdrant payload indexes** · source-filtered search · the full parse → classify → scope → retrieve path for both QUERY and WRITE. |
+
+## Regression guards worth knowing
+
+These tests exist because the bug actually happened:
+
+1. **Qdrant payload indexes** (`system.e2e.test.ts`) — without keyword indexes on
+   `source`/`namespace`, filtered search full-scans 68k+ points and **times out**,
+   silently returning zero results. The test asserts both indexes are `keyword`.
+
+2. **Email crowding out Notion** (`documents.test.ts`) — the flat top-k of chunks
+   let one chatty email monopolise the context. The test asserts that 5 chunks of
+   one email collapse into a single document so other documents survive.
+
+3. **`@brain` on a WRITE** (`sourceScope.test.ts`) — "edit `@brain` with tasks
+   from `@notion`" must read **Notion**. Treating the write target as a search
+   scope would read the Brain and find nothing.
+
+## Conventions
+
+- **Tests live in `__tests__/` next to the code** and match `**/__tests__/**/*.test.ts`.
+- **Prefer pure modules.** The reason the suite is fast is that the interesting
+  logic (`documents`, `sourceIntent`, `sourceScope`, `knowledgeScope`,
+  `sources/constants`) has **no I/O**. When adding a feature, push the decision
+  into a pure function and test that; keep I/O in a thin shell.
+- `vitest.config.ts` aliases `@` → repo root and stubs `server-only` (a
+  build-time guard with no runtime implementation).
+- Integration/E2E tests take a `USER_ID`; override with `E2E_USER_ID` to point at
+  your own seeded data.
+
+## Adding a test for a new source
+
+```ts
+// 1. Keyword detection
+expect(detectSourceIntent("what's in slack?")).toContain("slack");
+
+// 2. @-mention scoping
+expect(resolveSearchSources(
+  parseSubmission({ text: "…", references: [{ type: "entity", id: "slack", label: "@slack" }] }),
+  "QUERY"
+)).toEqual(["slack"]);
+
+// 3. Citations resolve (integration — needs a real row)
+const docs = await retrieveDocuments(userId, "…", { sources: ["slack"] });
+expect(docs.every(d => d.title.length > 0 && d.url)).toBe(true);
+```
+
+Step 3 is the one people forget — it's what catches a source that embeds fine but
+is **uncitable**.

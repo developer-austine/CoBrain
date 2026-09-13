@@ -1,0 +1,167 @@
+# 06 · Operations
+
+## Local development
+
+```bash
+# 1. Infrastructure (Postgres, Redis, Qdrant, MinIO + Python workers)
+cd backend && docker compose up -d && docker compose ps   # all should be healthy
+
+# 2. App
+pnpm install
+pnpm exec prisma generate
+pnpm dev            # http://localhost:3000
+```
+
+| Service | Port | Notes |
+|---------|------|-------|
+| Next.js | 3000 | |
+| Postgres | **5433** → 5432 | Note the host port |
+| Redis | 6379 | |
+| Qdrant | 6333 | REST/dashboard |
+| MinIO | 9000 / 9001 | API / console (`cobrain` / `cobrain-dev-secret`) |
+| search-api | 8000 | FastAPI, `/docs` |
+
+### Editing Python
+
+`backend/python/` is **volume-mounted** — no rebuild needed:
+
+```bash
+cd backend && docker compose restart ingest search-api worker
+```
+
+Rebuild only when dependencies change:
+```bash
+docker compose build --no-cache && docker compose up -d
+```
+
+---
+
+## Environment variables
+
+### Required
+
+| Key | Dev default | Purpose |
+|-----|-------------|---------|
+| `DATABASE_URL` | — | Business Postgres (`localhost:5433`) |
+| `AUTH_DATABASE_URL` | — | Better Auth Postgres (separate — Neon). `NEON_DATABASE_URL` is accepted as a fallback (the long-standing dev name); `lib/auth.ts` reads `AUTH_DATABASE_URL ?? NEON_DATABASE_URL`. |
+| `BETTER_AUTH_SECRET` | — | `openssl rand -base64 32` |
+| `APP_URL` | `http://localhost:3000` | Public origin; OAuth callbacks |
+| `REDIS_URL` | `redis://localhost:6379` | Ingestion queue |
+| `PYTHON_BACKEND_URL` | `http://localhost:8000` | search-api |
+| `QDRANT_URL` | `http://localhost:6333` | Vector store |
+
+### Object storage (uploads)
+
+| Key | Dev value |
+|-----|-----------|
+| `MINIO_ENDPOINT` | `localhost` |
+| `MINIO_PORT` | `9000` |
+| `MINIO_USE_SSL` | `false` |
+| `MINIO_ACCESS_KEY` | `cobrain` |
+| `MINIO_SECRET_KEY` | `cobrain-dev-secret` |
+| `MINIO_BUCKET` | `cobrain-uploads` |
+
+### Optional — the app degrades gracefully without these
+
+| Key | Without it |
+|-----|-----------|
+| `ANTHROPIC_API_KEY` | Chat falls back to **extractive** answers (direct quotes, still cited). Brain auto-write falls back to dictation. |
+| `ASSEMBLYAI_API_KEY` | **Voice input is disabled.** The mic will not work. |
+| `QDRANT_API_KEY` | Only needed for Qdrant Cloud / to lock down self-hosted. |
+
+### Connector OAuth (only what you use)
+
+`GITHUB_CLIENT_ID` / `_SECRET`, `GOOGLE_CLIENT_ID` / `_SECRET`,
+`NOTION_CLIENT_ID` / `_SECRET`. Redirect URIs must point at `APP_URL`.
+
+### Future keys (not yet wired)
+
+| Key | For |
+|-----|-----|
+| OCR provider (e.g. AWS Textract / Google Vision) | Scanned/image PDFs. They currently **fail by design** with a "needs OCR" message. |
+| Slack / Google Drive OAuth | `@slack` and `@drive` are already recognised by the scoping layer; they return nothing until a connector ingests them. |
+
+---
+
+## Production
+
+Host-agnostic scaffold. Everything is driven by the env file.
+
+```bash
+cp .env.production.example .env.production   # fill EVERY value
+docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+```
+
+```mermaid
+flowchart LR
+    NET([Internet]) --> RP["TLS proxy<br/>Caddy / Nginx / ALB"]
+    RP -->|127.0.0.1:3000| APP[app]
+    MIG[migrate] -->|runs once, then exits| APP
+    APP --> PG[(postgres)] & RD[(redis)] & MI[(minio)]
+    APP -->|http://search-api:8000| SA[search-api]
+    SA --> QD[(qdrant)]
+    ING[ingest] --> QD
+    ING --> PG
+    RD --> ING
+    WRK[worker] & BEAT[beat] --> RD
+```
+
+**What differs from dev:**
+- No bind-mounts — code is baked into images (`output: "standalone"`, non-root).
+- All secrets from the env file; **no defaults**.
+- Data services bind to `127.0.0.1` — put a TLS proxy in front of `app`.
+- `migrate` runs `prisma migrate deploy` once and the app waits for it
+  (`service_completed_successfully`).
+- Healthchecks + `restart: unless-stopped` on everything.
+
+**Using managed services** (Neon / Upstash / Qdrant Cloud / S3): delete the
+corresponding service from the compose file and point the `*_URL` vars at the
+provider. Nothing else changes.
+
+### Boot-time safety
+
+[`lib/config/env.ts`](../lib/config/env.ts) → `assertProductionConfig()`, called
+from `instrumentation.ts`, **refuses to start** in production if:
+
+- `APP_URL` still points at localhost
+- `MINIO_SECRET_KEY` is still the dev default
+- `MINIO_USE_SSL=false` against a remote storage endpoint
+
+A missing `ANTHROPIC_API_KEY` is a **warning**, not fatal (chat degrades).
+
+### Health
+
+`GET /api/health` → `200 {status:"ok"}` / `503 {status:"degraded"}`, reporting
+each dependency separately so a bad deploy tells you *which* one is down.
+Postgres is a hard dependency; the search API is soft.
+
+---
+
+## Known failure modes
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Prisma `ECONNREFUSED` + `[ioredis] AggregateError` flood | **The Docker stack is down.** Not a code bug. | `cd backend && docker compose up -d` |
+| Sign-in 500s with `getaddrinfo ENOTFOUND ...neon.tech` | **DNS** can't resolve the Neon auth host — a flaky VPN/corporate resolver, **not** a code bug (it often works once then flaps). | `ipconfig /flushdns`, or set public DNS (1.1.1.1 / 8.8.8.8), or reconnect the VPN. The `pg.Pool` in `lib/auth.ts` is hardened (keepAlive, 15s connect timeout, `pool.on('error')`) so idle-drops no longer crash. |
+| Every `docker` command returns HTTP 500 | Docker Desktop's engine has wedged. | Fully quit and reopen Docker Desktop (reboot clears a stuck WSL2 backend). |
+| **Every route 404s**, even `/sign-in` | Corrupted Turbopack/`.next` cache (common after a hard kill). | `rm -rf .next && pnpm dev` |
+| First source-filtered search times out → empty answers | **Missing Qdrant payload index on `source`** — it full-scans the collection. | `ensure_payload_indexes()` runs on search-api startup. Verify: `curl localhost:6333/collections/company_brain` → `payload_schema` must show `source` and `namespace` as `keyword`. |
+| Documents embed but are **uncitable** | New source missing from `resolveDocumentMeta()` (rag.ts) or from `table_map` (postgres_client.py). | See the checklist in [02-ingestion-pipeline.txt](./02-ingestion-pipeline.txt#adding-a-new-source--the-checklist). |
+| Answers are all email regardless of the question | Source scoping not applied — the query named no source and email out-volumes everything. | Use `@notion` / say "notion". See [03](./03-intelligence-layer.txt). |
+| Upload marked FAILED, `extractedChars = 0` | Scanned/image PDF. **By design** — no OCR yet. | Needs an OCR provider key. |
+
+### Useful commands
+
+```bash
+# Qdrant: confirm payload indexes + point count
+curl -s localhost:6333/collections/company_brain | python -m json.tool
+
+# Postgres
+docker exec company_brain_postgres psql -U company_brain -d company_brain -c '\dt'
+
+# Queue depth
+docker exec company_brain_redis redis-cli LLEN company_brain:ingest
+
+# Worker logs
+cd backend && docker compose logs -f ingest search-api
+```

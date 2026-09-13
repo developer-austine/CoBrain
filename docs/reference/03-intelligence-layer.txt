@@ -1,0 +1,218 @@
+# 03 · Intelligence Layer
+
+How a question becomes a **cited answer**, and how the AI **writes what it learns**.
+
+Entry point: [`app/api/prompt/route.ts`](../app/api/prompt/route.ts) (SSE stream).
+
+## The pipeline
+
+```mermaid
+flowchart TB
+    S["Submission<br/>{ text, references[], inputMethod }"]
+    S --> P["parseSubmission()<br/>references.ts"]
+    P --> R["ParsedPrompt<br/>prose · writeTargets · model · contextRefs"]
+    R --> C["classifyIntent()<br/>intentClassifier.ts"]
+    C --> AUD[(PromptEvent<br/>audit)]
+
+    C --> D{Intent?}
+    D -->|low confidence| CL["Ask ONE clarifying question<br/>act on nothing"]
+    D -->|QUERY| Q1[resolveSearchSources QUERY]
+    D -->|CONFIG| CF["createAgentConfig()<br/>standing rule"]
+    D -->|WRITE| W1[resolveSearchSources WRITE]
+
+    Q1 --> Q2["streamRagAnswer()"]
+    W1 --> W2["retrieveDocuments()"] --> W3["draftFromSources()"] --> W4["writeBrainBlock()"]
+```
+
+## 1 · References are structured, never parsed
+
+The frontend **never** sends `@brain` as parseable text. Mentions are tokens
+picked from a dropdown:
+
+```ts
+{ text: "Who was given a task on the @notion page?",
+  references: [{ type: "entity", id: "notion", label: "@notion" }] }
+```
+
+`parseSubmission()` splits this into:
+
+| Field | From | Used for |
+|-------|------|----------|
+| `prose` | text with mention labels blanked | classification + the search query |
+| `writeTargets` | `type: "page"` refs (`@brain`) | **where to write** |
+| `model` | `type: "model"` refs (`@claude`, `@extractive`) | synthesis model |
+| `contextRefs` | `type: "entity"` refs (`@notion`, `@files`) | **what to read** |
+
+Catalog lives in [`lib/interactive/references.ts`](../lib/interactive/references.ts)
+→ `REFERENCE_CATALOG`. Entity ids that match a `SourceKey` automatically scope
+the search.
+
+## 2 · Source scoping — the thing that makes answers correct
+
+**The problem.** Email out-volumes everything. Ask "what tasks are in Notion?"
+and an unfiltered vector search returns *13 emails and 2 Notion pages* — so the
+answer is about email. Verified on real data.
+
+**The fix.** Resolve which sources to search, then **filter the vector search**.
+
+[`lib/interactive/sourceScope.ts`](../lib/interactive/sourceScope.ts) →
+`resolveSearchSources(parsed, intent)`, in precedence order:
+
+```mermaid
+flowchart TB
+    A["Entity mentions?<br/>@notion, @github, @files"] -->|yes| A1["Use them. Done."]
+    A -->|no| B{Intent}
+    B -->|QUERY| C["Page mentions?<br/>@brain"] -->|yes| C1["Scope to them"]
+    B -->|WRITE| D["Page mention is the DESTINATION.<br/>Never the search scope."]
+    C -->|no| E
+    D --> E["Keyword fallback<br/>detectSourceIntent(prose)"]
+    E --> F["Empty ⇒ search everything"]
+```
+
+**The critical rule:** on a `WRITE`, `@brain` is *where to write*, not *what to
+read*. Otherwise "edit `@brain` with tasks from `@notion`" would read the Brain
+and find nothing.
+
+**Keyword fallback** ([`lib/chat/sourceIntent.ts`](../lib/chat/sourceIntent.ts))
+catches plain prose:
+
+| Keywords | Source |
+|----------|--------|
+| notion, page(s), wiki | `notion` |
+| code, github, repo, issue, commit, PR | `github` |
+| email, gmail, mail, inbox | `gmail` |
+| file, document, pdf, upload | `upload` |
+| slack, channel | `slack` |
+| drive, google docs, sheet | `drive` |
+| brain, memory | `brain` |
+
+Matched on **word boundaries**, so "di**git**al" does not trigger GitHub and
+"e**mail**" does not double-match.
+
+> **Email is only searched when explicitly asked for.** Naming any other source
+> excludes it.
+
+## 3 · Retrieval — read whole documents, not chunks
+
+**The problem.** Qdrant ranks *chunks*. Five chunks of one chatty email crowd out
+three separate Notion pages, so the model only ever sees one document and gives
+one narrow answer.
+
+**The fix.** [`lib/chat/documents.ts`](../lib/chat/documents.ts) →
+`groupChunksByDocument()`.
+
+```mermaid
+flowchart LR
+    subgraph Before["Flat top-k chunks"]
+        direction TB
+        B1["email#1 chunk 0"]
+        B2["email#1 chunk 1"]
+        B3["email#1 chunk 2"]
+        B4["email#1 chunk 3"]
+        B5["notion A chunk 0"]
+        B6["…notion B, C never seen"]
+    end
+
+    subgraph After["Regrouped documents"]
+        direction TB
+        A1["📄 email#1 (4 chunks merged)"]
+        A2["📄 notion A"]
+        A3["📄 notion B"]
+        A4["📄 notion C"]
+    end
+
+    Before -->|groupChunksByDocument| After
+```
+
+- Chunks collapse into their parent document, text reassembled **in chunk order**.
+- Documents ranked by their **best** chunk score.
+- Scoped queries sweep **60 chunks**; up to **12 documents** reach the model.
+- The model is instructed to read **every** document and **exhaustively
+  enumerate** (a table with owner / why per row).
+
+## 4 · Citations
+
+`retrieveDocuments()` resolves every document id back to Postgres via
+`resolveDocumentMeta()`, producing a title, author and **a real link**:
+
+| Source | Link |
+|--------|------|
+| `gmail` | `https://mail.google.com/mail/u/0/#all/{messageId}` |
+| `notion` | the page URL |
+| `github` | the issue/PR URL |
+| `brain` | `/brain?block={id}` |
+| `upload` | `/api/sources/{id}/download` |
+
+Citations are **numbered**, and those numbers match the `[1]`, `[2]` markers the
+model emits inline. `components/chat/SourceCitations.tsx` groups them by source.
+
+## 5 · Writing to the Brain
+
+Two kinds of write, distinguished by whether the prompt points at any source:
+
+```mermaid
+flowchart TB
+    W[WRITE intent] --> S{Any source<br/>referenced?}
+    S -->|No — dictation| D["draftFromWritePrompt()<br/>The user's words ARE the content<br/>createdBy: human · confidence 0.95"]
+    S -->|Yes — go and learn| L["retrieveDocuments(sources)"]
+    L --> M["draftFromSources()<br/>Claude → JSON block:<br/>type · title · body(Markdown) · data · confidence"]
+    M --> V["validateDraft()"]
+    V --> G{confidence ≥ 0.7<br/>or human?}
+    G -->|yes| A[(status: active<br/>live on the page)]
+    G -->|no| RQ[(status: queued_for_review<br/>human must approve)]
+    A --> E["embedBrainBlock()<br/>LPUSH source='brain'"]
+    E --> QD[(Qdrant — now citable)]
+```
+
+`draftFromSources()` ([`lib/interactive/pageMutation.ts`](../lib/interactive/pageMutation.ts))
+instructs the model to record **who / when / why**, render enumerables as a
+Markdown table, bold names, cite `[n]`, and write **"Not stated"** rather than
+inventing a value.
+
+**Provenance:** `sourceRefs` on the block stores every document it was derived
+from (`source`, `docId`, `title`, `url`). Nothing on the Brain is unattributable.
+
+**Review queue:** low-confidence AI writes never touch the page and are **not**
+embedded — they cannot become citable knowledge until a human approves them.
+
+## 6 · Voice
+
+Voice is **only an input method**. Mic → 16 kHz PCM → AssemblyAI over WebSocket →
+partials stream into the pill → the final text lands in the prompt box and is
+submitted through the **identical** flow as typing (`inputMethod: "voice"` is
+recorded for audit only).
+
+- [`lib/hooks/useSpeechToText.ts`](../lib/hooks/useSpeechToText.ts) — the socket + audio graph.
+  Also exposes `levelRef`, a live 0–1 microphone loudness (RMS computed in the same
+  `onaudioprocess` loop that ships PCM). It's a **ref, not state** — it updates ~4×/sec
+  and must never trigger a React render.
+- [`lib/hooks/useTypewriter.ts`](../lib/hooks/useTypewriter.ts) — reveals partials
+  character-by-character. Partials *grow* (`"who"` → `"who was"`), so it only ever
+  catches up; it resets **only** when the recogniser revises the prefix.
+- [`lib/hooks/useWaveform.ts`](../lib/hooks/useWaveform.ts) — a `requestAnimationFrame`
+  loop that samples `levelRef` at 60fps and writes each bar's height **directly to the
+  DOM** (never through state). Bars carry phase offsets so the row reads as a travelling
+  wave that swells with your voice and settles to a gentle idle breathe in silence.
+- [`components/chat/VoicePill.tsx`](../components/chat/VoicePill.tsx) — the dark
+  pill below the prompt box: amplitude-reactive white bars + the live transcript typed
+  out. Falls back to a CSS breathe (`cobrain-pulse`) while the socket is still connecting.
+
+## 7 · Multi-workflow knowledge
+
+[`lib/workflow/knowledgeScope.ts`](../lib/workflow/knowledgeScope.ts)
+
+A link `A → B` means **B may search A's knowledge**. Flow is **transitive**
+(`A → B → C` lets C read A) and the graph must stay a **DAG** — `canLink()`
+refuses self-links, duplicates and anything that would create a cycle.
+
+```mermaid
+flowchart LR
+    A[Engineering] --> B[Support]
+    B --> C[Exec]
+    U[(Uploaded files)] -.->|available to all| A & B & C
+
+    style U stroke-dasharray: 4 4
+```
+
+`Exec` can cite Engineering's GitHub issues without re-ingesting them. Managed on
+the Home page via `KnowledgeFlow.tsx`.

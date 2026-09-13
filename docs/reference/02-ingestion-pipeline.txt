@@ -1,0 +1,185 @@
+# 02 · Ingestion Pipeline
+
+How a Gmail message, a Notion page, or an uploaded PDF becomes a searchable,
+citable vector.
+
+## The rule
+
+**Every source uses the same pipeline.** There is no special path for uploads or
+for the Brain. A new source only needs (a) something that writes rows to Postgres
+and pushes a payload to Redis, and (b) a mapper on the Python side. That is it.
+
+## End-to-end flow
+
+```mermaid
+flowchart TB
+    subgraph Acquire["1 · Acquire (Next.js)"]
+        OA["OAuth connect<br/>/api/{gmail,notion,github}/auth"]
+        SY["Sync<br/>/api/{connector}/sync"]
+        UPL["Upload<br/>/api/sources/upload"]
+        WH["Webhook<br/>/api/custom_api/ingest"]
+    end
+
+    subgraph Persist["2 · Persist source of truth"]
+        T1[("Email / NotionPage /<br/>GitHubItem / CustomDocument")]
+        T2[("SourceFile")]
+        MI[(MinIO bytes)]
+    end
+
+    Q[["Redis list<br/>company_brain:ingest"]]
+
+    subgraph Process["3 · Process (Python ingest worker)"]
+        M["mappers/*<br/>QueuePayload → RawDocument"]
+        N[normalizer]
+        PII[pii · presidio + spaCy]
+        DD[deduplicator]
+        CK[chunker]
+        EM["embedder<br/>sentence-transformers"]
+    end
+
+    QD[(Qdrant)]
+
+    OA --> SY --> T1
+    UPL --> MI
+    UPL --> T2
+    WH --> T1
+    T1 & T2 -->|LPUSH QueuePayload| Q
+    Q -->|BRPOP| M --> N --> PII --> DD --> CK --> EM --> QD
+    EM -->|status = PROCESSED| T1 & T2
+```
+
+## Status lifecycle
+
+Every ingested record carries the same fields, so the UI can show progress and
+failures uniformly.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: row created
+    PENDING --> QUEUED: pushed to Redis
+    QUEUED --> PROCESSED: vectors written
+    QUEUED --> FAILED: pipeline error
+    FAILED --> [*]
+    PROCESSED --> [*]
+```
+
+| Field | Meaning |
+|-------|---------|
+| `status` | `PENDING` → `QUEUED` → `PROCESSED` \| `FAILED` |
+| `queuedAt` | When it was pushed to Redis |
+| `processedAt` | When the pipeline finished (success or failure) |
+| `errorMessage` | Why it failed |
+
+Python writes these back via
+[`backend/python/db/postgres_client.py`](../backend/python/db/postgres_client.py)
+→ `update_document_status()`, which maps a `source` string to its Prisma table:
+
+```python
+table_map = {
+    "gmail":  "Email",
+    "notion": "NotionPage",
+    "github": "GitHubItem",
+    "custom": "CustomDocument",
+    "upload": "SourceFile",
+}
+```
+
+> `brain` is deliberately absent — BrainBlock status is owned by the Next.js
+> layer, so the pipeline early-returns for it.
+
+## The queue contract
+
+One JSON object per list entry. This is the seam between Next.js and Python —
+**if you change it, change both sides.**
+
+```jsonc
+{
+  "raw_document_id": "uuid",   // Postgres id — becomes parent_doc_id in Qdrant
+  "source": "notion",          // drives mapper lookup AND search scoping
+  "external_id": "abc123",
+  "author": "Jane Doe",
+  "subject": "Q3 Planning",
+  "content": "full plain text",
+  "timestamp": "2026-07-14T10:00:00Z",
+  "metadata": { "file_name": "spec.pdf" },
+  "connector_id": "",
+  "namespace": "userId:notion"  // RBAC boundary — set server-side, never trusted from a client
+}
+```
+
+Pushed with `LPUSH company_brain:ingest`, popped with `BRPOP`.
+
+## Pipeline stages
+
+| Stage | File | What it does |
+|-------|------|--------------|
+| Map | [`mappers/*.py`](../backend/python/mappers/) | `QueuePayload` → `RawDocument`. One mapper per source, registered in `MAPPER_REGISTRY`. |
+| Normalize | [`pipeline/normalizer.py`](../backend/python/pipeline/normalizer.py) | Strip boilerplate/signatures, standardise whitespace |
+| PII | [`pipeline/pii.py`](../backend/python/pipeline/pii.py) | Detect + pseudonymise PII. Mappings are written to `PIIAuditMapping` (reversible, restricted). |
+| Dedupe | [`pipeline/deduplicator.py`](../backend/python/pipeline/deduplicator.py) | Content-hash; skip re-embedding unchanged content |
+| Chunk | [`pipeline/chunker.py`](../backend/python/pipeline/chunker.py) | Split into semantic chunks |
+| Embed | [`pipeline/embedder.py`](../backend/python/pipeline/embedder.py) | `all-MiniLM-L6-v2` (384-dim) → upsert to Qdrant |
+
+### The Qdrant payload
+
+What lands on each vector — and what every downstream feature depends on:
+
+| Key | Used by |
+|-----|---------|
+| `text` | Answer synthesis |
+| `source` | **Source scoping** (`@notion`, keyword detection) — *keyword-indexed* |
+| `namespace` | RBAC boundary — *keyword-indexed* |
+| `parent_doc_id` | **Citation resolution** back to Postgres |
+| `chunk_index`, `total_chunks` | Reassembling documents in order |
+| `content_hash` | Dedup |
+
+## Uploads (the newest source)
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant R as POST /api/sources/upload
+    participant M as MinIO
+    participant P as Postgres
+    participant Q as Redis
+
+    U->>R: multipart file
+    R->>R: validateUpload (type, size ≤ 25MB)
+    R->>M: putObject(userId/uuid-name)
+    R->>P: SourceFile (PENDING)
+    R->>R: extractText (pdf-parse / mammoth / utf-8)
+    alt no extractable text
+        R->>P: FAILED ("scanned images need OCR")
+    else
+        R->>Q: LPUSH { source: "upload" }
+        R->>P: QUEUED + extractedChars
+    end
+```
+
+- Bytes live in **MinIO**, never in Postgres.
+- The citation link for an upload is `/api/sources/{id}/download`, which streams
+  the original file back to its owner.
+- **Scanned/image PDFs fail by design** with a helpful message — there is no OCR
+  yet. Adding it means an OCR service key (see [06-operations.txt](./06-operations.txt)).
+
+## Adding a new source — the checklist
+
+1. **Prisma**: add a `*Connection` and a `*Item` model with the status fields
+   (`status`, `errorMessage`, `queuedAt`, `processedAt`). Migrate.
+2. **Acquire**: add `app/api/{source}/auth` + `callback` + `sync` routes.
+3. **Queue**: push the payload contract above with `source: "yourSource"`.
+4. **Python mapper**: `backend/python/mappers/yourSource.py`, register it in
+   `mappers/__init__.py` → `MAPPER_REGISTRY`.
+5. **Status**: add `"yourSource": "YourItem"` to `table_map` in
+   `db/postgres_client.py` (**both** functions).
+6. **Citations**: add a `case "yourSource"` to `resolveDocumentMeta()` in
+   [`lib/chat/rag.ts`](../lib/chat/rag.ts) returning `{title, author, url}`.
+7. **Scoping**: add the key to `SOURCE_KEYS` in
+   [`lib/chat/sourceIntent.ts`](../lib/chat/sourceIntent.ts), give it keywords,
+   and add an `@mention` entry in
+   [`lib/interactive/references.ts`](../lib/interactive/references.ts).
+8. **Label**: add it to `SOURCE_LABELS` in `components/chat/SourceCitations.tsx`.
+9. **Restart** the Python containers (`docker compose restart ingest search-api`).
+
+Miss step 5 or 6 and documents will embed but be **uncitable** — the most common
+mistake.

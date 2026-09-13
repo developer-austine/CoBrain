@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -rf app/fc-preview)",
+      "Bash(rm -f .tmp-ui.html)",
+      "Bash(curl -s -o /dev/null -w \"forecasts page: %{http_code}\\\\n\" http://localhost:3000/forecasts)",
+      "Bash(curl -s -o /dev/null -w \"root: %{http_code}\\\\n\" http://localhost:3000/)",
+      "Bash(node -e \"console.log\\(require\\('./node_modules/recharts/package.json'\\).version\\)\")",
+      "Bash(git reset *)",
+      "Bash(node -e \"const l=require\\('./node_modules/lucide-react/package.json'\\); console.log\\('lucide', l.version\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(curl -s -w \"\\\\nHTTP %{http_code}\\\\n\" \"http://localhost:3000/api/__viz_probe?t=gf1Qameb8t8fpvr1UQ1N8GXVVFwKE5RI\")",
+      "Bash(curl -s -o /dev/null -w \"root: %{http_code}\\\\n\" --max-time 15 http://localhost:3000/)",
+      "Bash(curl -s -o /dev/null --max-time 3 http://localhost:3000/)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\\\\n\" --max-time 5 http://localhost:3000/)",
+      "Bash(curl -s --max-time 180 -w \"\\\\n=== HTTP %{http_code} ===\\\\n\" \"http://localhost:3000/api/__viz_probe?t=gf1Qameb8t8fpvr1UQ1N8GXVVFwKE5RI\")",
+      "Bash(curl -s --max-time 180 \"http://localhost:3000/api/vizprobetmp?t=PsEeuXvfhEcPtK2u4kFcoE3ekhOVdyyK\")",
+      "Read(//c/Users/Max/AppData/Local/Docker/wsl/disk/**)",
+      "Read(//c/Users/Max/AppData/Local/Docker/wsl/**)",
+      "Bash(curl -s -o /dev/null -w \"server: %{http_code}\\\\n\" --max-time 20 http://localhost:3000/)"
+    ]
+  }
+}

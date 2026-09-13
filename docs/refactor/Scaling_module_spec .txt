@@ -1,0 +1,632 @@
+================================================================================
+COBRAIN — SCALING MODULE
+DRIFT HANDLING · PRODUCTION STORAGE · SECURITY HARDENING
+IMPLEMENTATION SPECIFICATION FOR THE ENGINEERING AGENT
+================================================================================
+Scope            : The next sprint module. Three workstreams that must land
+                   before customer count grows: (A) model drift handling,
+                   (B) production document storage, (C) security hardening.
+Document type    : Executable build specification
+Audience         : The AI agent implementing this. Read fully before coding.
+Relation         : Extends TFT_IMPLEMENTATION_SPEC.txt (m_learning/) and the
+                   existing backend (connectors, pipeline, Sources page).
+                   Nothing here replaces those — it hardens and extends them.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+0. AGENT — READ THIS FIRST
+--------------------------------------------------------------------------------
+You are building three workstreams. They are independent enough to build in
+parallel but MUST be built in the priority order of Section 1 if done serially.
+
+Rules:
+  - Every store access in every new file requires a tenant_id. No exceptions.
+  - Where code is given, use it as written. Where a spec is given, implement to
+    the spec matching the conventions of the given code.
+  - Each workstream ends with tests listed in its final subsection. A workstream
+    is not complete until its tests pass.
+  - Do not ask clarifying questions about anything specified here.
+
+WHY THIS MODULE EXISTS
+  1. DRIFT   — tenants change (review rates rise, teams double). The model and
+     its normalisation stats age. Unhandled, forecasts silently rot.
+  2. STORAGE — Docker-volume MinIO is a dev setup. Production needs real object
+     storage with lifecycle, dedup, and per-tenant deletion.
+  3. SECURITY— the product stores customers' crucial documents. A cross-tenant
+     leak is a lawsuit. The tenant boundary must be structural, not conventional.
+
+
+--------------------------------------------------------------------------------
+1. PRIORITY ORDER (if building serially)
+--------------------------------------------------------------------------------
+  P1  Per-tenant encryption keys + Postgres Row-Level Security   (Workstream C)
+  P2  Drift monitoring job (calibration + distribution shift)    (Workstream A)
+  P3  Storage abstraction + R2/S3 backend + presigned URLs       (Workstream B)
+  P4  Champion/challenger retraining loop                        (Workstream A)
+  P5  Sandboxed document parser worker                           (Workstream C)
+  P6  Lifecycle tiering, dedup, audit shipping, rate limits      (B + C)
+
+  Rationale: P1 and P2 are unrecoverable if late (legal exposure; silent model
+  decay). Everything else degrades gracefully.
+
+
+================================================================================
+WORKSTREAM A — MODEL DRIFT HANDLING
+================================================================================
+
+--------------------------------------------------------------------------------
+A1. THE REFRAME (design principle — encode it in the README)
+--------------------------------------------------------------------------------
+Changing tenant data is NOT invalidated data. The model learns DYNAMICS, not
+static facts. A tenant whose review rate rises from low to high produces one of
+the most valuable training sequences in the fleet: a transition. Therefore:
+
+  RULE A-1: NEVER delete or down-weight old tenant history because "the company
+            changed". Transitions are training gold.
+  RULE A-2: What ages is (a) normalisation statistics and (b) model weights.
+            Both get versioned, refreshed on schedule, and promoted only when
+            proven better.
+
+--------------------------------------------------------------------------------
+A2. FOLDER ADDITIONS (inside m_learning/)
+--------------------------------------------------------------------------------
+m_learning/
+├── monitoring/
+│   ├── __init__.py
+│   ├── calibration.py        # quantile coverage per tenant per target
+│   ├── drift_detector.py     # PSI + KS tests on feature distributions
+│   └── run_monitoring.py     # CLI, runs weekly, writes DriftReport rows
+│
+├── lifecycle/
+│   ├── __init__.py
+│   ├── norm_versioning.py    # versioned TenantNormalizer stats
+│   ├── retrain.py            # scheduled retrain entrypoint
+│   ├── shadow.py             # champion/challenger shadow inference
+│   └── promotion.py          # promotion gate logic
+│
+└── (existing folders unchanged)
+
+--------------------------------------------------------------------------------
+A3. VERSIONED NORMALISATION STATS
+--------------------------------------------------------------------------------
+Problem: TenantNormalizer fits stats on a training window. A level shift
+(headcount doubles) makes frozen stats mis-scale everything permanently.
+
+Spec:
+  - Refit stats MONTHLY per tenant on the trailing 52 observed weeks.
+  - Stats are versioned: norm_stats_v{n} with created_at and window bounds.
+  - Every checkpoint records which stats version it was trained against.
+  - A forecast is ONLY served if scaled with the stats version its model was
+    trained on. Mixing versions is an error, not a warning.
+
+FILE: m_learning/lifecycle/norm_versioning.py
+```python
+import json, hashlib, datetime as dt
+from dataclasses import dataclass, asdict
+
+@dataclass
+class NormStatsVersion:
+    tenant_id: str
+    version: int
+    window_start: str          # ISO date
+    window_end: str            # ISO date
+    stats: dict                # {feature: (mu, sd)}
+    created_at: str
+
+    @property
+    def fingerprint(self) -> str:
+        payload = json.dumps(self.stats, sort_keys=True).encode()
+        return hashlib.sha256(payload).hexdigest()[:16]
+
+class NormStatsRegistry:
+    """Backed by Postgres table norm_stats(tenant_id, version, payload jsonb).
+    All reads/writes namespaced by tenant_id."""
+
+    def __init__(self, db):
+        self.db = db
+
+    def latest(self, tenant_id: str) -> NormStatsVersion | None:
+        row = self.db.fetchone(
+            "SELECT payload FROM norm_stats WHERE tenant_id=%s "
+            "ORDER BY version DESC LIMIT 1", (tenant_id,))
+        return NormStatsVersion(**row["payload"]) if row else None
+
+    def publish(self, v: NormStatsVersion):
+        self.db.execute(
+            "INSERT INTO norm_stats (tenant_id, version, payload) "
+            "VALUES (%s, %s, %s)",
+            (v.tenant_id, v.version, json.dumps(asdict(v))))
+
+def refit_tenant(tenant_id, feature_df, registry, window_weeks=52):
+    from m_learning.data.normalizer import TenantNormalizer
+    recent = feature_df.tail(window_weeks)
+    norm = TenantNormalizer().fit(recent, train_end=recent.index.max())
+    prev = registry.latest(tenant_id)
+    v = NormStatsVersion(
+        tenant_id=tenant_id,
+        version=(prev.version + 1) if prev else 1,
+        window_start=str(recent.index.min().date()),
+        window_end=str(recent.index.max().date()),
+        stats=norm.stats,
+        created_at=dt.datetime.utcnow().isoformat(),
+    )
+    registry.publish(v)
+    return v
+```
+
+--------------------------------------------------------------------------------
+A4. DRIFT MONITORING (the tripwire — ~200 lines, highest value in workstream)
+--------------------------------------------------------------------------------
+Runs WEEKLY per tenant per forecast target. Two signals:
+
+SIGNAL 1 — FORECAST CALIBRATION (is the model still honest?)
+  For every forecast whose target week has now elapsed, check whether the true
+  value fell inside the P10–P90 band. Expected coverage ≈ 0.80.
+  Alarm if trailing-12-week coverage < 0.65 or > 0.95 (too wide is also drift).
+
+SIGNAL 2 — FEATURE DISTRIBUTION SHIFT (has the input world moved?)
+  Compare each feature's recent 8-week distribution against the training-window
+  distribution using PSI (population stability index).
+  PSI < 0.10 stable · 0.10–0.25 drifting · > 0.25 alarm.
+
+FILE: m_learning/monitoring/calibration.py
+```python
+def coverage(forecasts, actuals):
+    """
+    forecasts: list of dicts {week, p10, p50, p90} already elapsed
+    actuals:   {week: true_value}
+    returns fraction of weeks where p10 <= actual <= p90
+    """
+    hits, n = 0, 0
+    for f in forecasts:
+        y = actuals.get(f["week"])
+        if y is None:
+            continue
+        n += 1
+        if f["p10"] <= y <= f["p90"]:
+            hits += 1
+    return (hits / n) if n else None
+```
+
+FILE: m_learning/monitoring/drift_detector.py
+```python
+import numpy as np
+
+def psi(train_vals, recent_vals, bins=10):
+    """Population Stability Index between two samples of one feature."""
+    edges = np.quantile(train_vals, np.linspace(0, 1, bins + 1))
+    edges[0], edges[-1] = -np.inf, np.inf
+    t_hist, _ = np.histogram(train_vals, bins=edges)
+    r_hist, _ = np.histogram(recent_vals, bins=edges)
+    t_pct = np.clip(t_hist / max(t_hist.sum(), 1), 1e-6, None)
+    r_pct = np.clip(r_hist / max(r_hist.sum(), 1), 1e-6, None)
+    return float(((r_pct - t_pct) * np.log(r_pct / t_pct)).sum())
+```
+
+OUTPUT: a DriftReport row per tenant per week:
+  drift_report(tenant_id, week, target, coverage_12w, worst_psi_feature,
+               worst_psi_value, status ENUM('ok','drifting','alarm'))
+Tenants with status='alarm' are prioritised in the next retrain and their
+forecasts get a `stale_model: true` flag the UI can display.
+
+--------------------------------------------------------------------------------
+A5. CHAMPION / CHALLENGER RETRAINING
+--------------------------------------------------------------------------------
+NEVER hot-swap a retrained model. The loop:
+
+  1. SCHEDULED RETRAIN (monthly, or on drift alarms): train challenger on all
+     data to date using current norm stats versions. Rolling windows mean every
+     elapsed week added labelled examples for free.
+  2. SHADOW PHASE (2–4 weeks): challenger runs inference alongside champion on
+     the SAME inputs. Both predictions stored; only champion's are served.
+  3. PROMOTION GATE: challenger promotes only if, on weeks that elapsed during
+     the shadow phase:
+       - mean pinball loss  <= 0.98 * champion's  (must actually win)
+       - calibration coverage in [0.70, 0.92]
+       - no tenant's coverage degrades by > 0.15
+  4. PROMOTE: challenger becomes champion. Old champion is retained in the
+     model registry for rollback. Model registry records: checkpoint, training
+     data as-of date, norm stats versions used, git commit.
+
+FILE: m_learning/lifecycle/promotion.py
+```python
+def should_promote(champ_metrics, chall_metrics):
+    if chall_metrics["pinball"] > 0.98 * champ_metrics["pinball"]:
+        return False, "challenger did not beat champion on pinball loss"
+    cov = chall_metrics["coverage"]
+    if not (0.70 <= cov <= 0.92):
+        return False, f"challenger coverage {cov:.2f} out of bounds"
+    worst = chall_metrics["worst_tenant_coverage_delta"]
+    if worst < -0.15:
+        return False, f"a tenant degraded by {abs(worst):.2f}"
+    return True, "promoted"
+```
+
+RULE A-3: every training run records its data snapshot timestamp. "Model v23,
+features as-of 2026-03-01, norm stats v14" must be reconstructable. This is
+what saves you when a customer asks why a forecast changed.
+
+--------------------------------------------------------------------------------
+A6. WORKSTREAM A TESTS
+--------------------------------------------------------------------------------
+  tests/test_norm_versioning.py   - refit bumps version; serving with mismatched
+                                    stats/model versions raises
+  tests/test_calibration.py       - synthetic forecasts give exact coverage
+  tests/test_psi.py               - identical samples → PSI ≈ 0; shifted
+                                    samples → PSI > 0.25
+  tests/test_promotion_gate.py    - each rejection branch fires correctly
+
+
+================================================================================
+WORKSTREAM B — PRODUCTION DOCUMENT STORAGE
+================================================================================
+
+--------------------------------------------------------------------------------
+B1. THE ARCHITECTURE DECISION
+--------------------------------------------------------------------------------
+KEEP the S3-compatible API as the storage contract. Swap the backend by
+deployment profile. Nothing in the pipeline changes between profiles.
+
+  Profile          Backend                      When
+  ---------------  ---------------------------  ---------------------------
+  SaaS (hosted)    Cloudflare R2 (or S3)        default for cloud customers
+  Enterprise       Distributed MinIO (4+ nodes, customer's own infrastructure
+                   erasure coding)              — the sovereignty tier
+  Dev              MinIO single node in Docker  local only. NEVER production.
+
+WHY R2 SPECIFICALLY FOR SAAS: zero egress fees. The pipeline READS documents
+repeatedly (extraction, re-embedding, reprocessing). S3 egress pricing punishes
+exactly this access pattern; R2 does not. Storage ≈ $0.015/GB-month.
+
+RULES:
+  RULE B-1: Postgres stores METADATA (SourceFile row: storageKey, hash, size,
+            status). Object storage stores BYTES. Never file bytes in Postgres.
+  RULE B-2: Content-addressed keys: {tenant_id}/{sha256}. Duplicate uploads
+            dedupe for free. Per-tenant deletion = one prefix operation.
+  RULE B-3: All access through ONE storage module. No direct SDK calls
+            scattered through the codebase.
+
+--------------------------------------------------------------------------------
+B2. FOLDER ADDITIONS (backend)
+--------------------------------------------------------------------------------
+backend/storage/
+├── __init__.py
+├── object_store.py        # the ONE abstraction. boto3-compatible client
+├── presign.py             # signed, expiring URL issuance
+├── lifecycle.py           # tiering rules (hot → infrequent → archive)
+└── dedup.py               # sha256 hashing + existing-object check
+
+--------------------------------------------------------------------------------
+B3. THE STORAGE ABSTRACTION
+--------------------------------------------------------------------------------
+FILE: backend/storage/object_store.py
+```python
+import hashlib
+import boto3
+from botocore.config import Config as BotoConfig
+
+class ObjectStore:
+    """
+    Single entry point for ALL document bytes. Works identically against
+    R2, S3, and MinIO (all S3-compatible). Backend chosen by env config.
+    Every method REQUIRES tenant_id — key construction enforces the prefix.
+    """
+
+    def __init__(self, endpoint_url, access_key, secret_key, bucket):
+        self.bucket = bucket
+        self.s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint_url,          # R2/MinIO endpoint or None for AWS
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+            config=BotoConfig(signature_version="s3v4"),
+        )
+
+    @staticmethod
+    def key_for(tenant_id: str, content: bytes) -> str:
+        digest = hashlib.sha256(content).hexdigest()
+        return f"{tenant_id}/{digest}"          # RULE B-2
+
+    def put(self, tenant_id: str, content: bytes,
+            content_type: str) -> tuple[str, bool]:
+        """Returns (key, was_new). Dedupes by content hash."""
+        key = self.key_for(tenant_id, content)
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+            return key, False                    # already stored — dedup hit
+        except self.s3.exceptions.ClientError:
+            pass
+        self.s3.put_object(Bucket=self.bucket, Key=key, Body=content,
+                           ContentType=content_type,
+                           ServerSideEncryption="AES256")
+        return key, True
+
+    def delete_tenant(self, tenant_id: str):
+        """Offboarding: delete every object under the tenant prefix."""
+        paginator = self.s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket,
+                                       Prefix=f"{tenant_id}/"):
+            objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+            if objs:
+                self.s3.delete_objects(Bucket=self.bucket,
+                                       Delete={"Objects": objs})
+```
+
+--------------------------------------------------------------------------------
+B4. PRESIGNED URLS — THE ONLY WAY DOCUMENT BYTES ARE SERVED
+--------------------------------------------------------------------------------
+The API NEVER streams file bytes. It authorises, then issues a presigned URL
+with a short TTL. This is the anti-scraping backbone: leaked URLs die in
+minutes, and every issuance is attributable to an authenticated identity.
+
+FILE: backend/storage/presign.py
+```python
+PRESIGN_TTL_SECONDS = 300      # 5 minutes. Do not raise without review.
+
+def issue_download_url(store, tenant_id: str, storage_key: str,
+                       requesting_user) -> str:
+    # authorisation: user must belong to the tenant that owns the object
+    assert storage_key.startswith(f"{tenant_id}/"), "cross-tenant key"
+    assert requesting_user.tenant_id == tenant_id, "cross-tenant access denied"
+
+    url = store.s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": store.bucket, "Key": storage_key},
+        ExpiresIn=PRESIGN_TTL_SECONDS,
+    )
+    # audit BEFORE returning (Workstream C ships this log to immutable storage)
+    audit_log("document.presign", user=requesting_user.id,
+              tenant=tenant_id, key=storage_key)
+    return url
+```
+
+--------------------------------------------------------------------------------
+B5. LIFECYCLE TIERING (the 75-year story without the 75-year bill)
+--------------------------------------------------------------------------------
+Raw originals that have been extracted + embedded are rarely re-read.
+
+  Age / state                          Storage class
+  -----------------------------------  -------------------------------
+  < 90 days, or status != PROCESSED    Standard (hot)
+  > 90 days untouched, PROCESSED       Infrequent Access
+  > 2 years untouched                  Archive class
+
+Implement as bucket lifecycle rules (R2/S3 native, MinIO ILM) configured by
+backend/storage/lifecycle.py at deploy time — not as an application cron.
+The SourceFile row keeps `storage_class` in sync via S3 event notifications
+where available, else a weekly reconciliation job.
+
+CAPACITY REALITY (encode in README to prevent panic-engineering): a document-
+heavy 500-person firm rarely exceeds 1–5 TB. At R2 pricing that is tens of
+dollars/month/tenant. Egress, not storage, is the cost that kills — which is
+why the backend choice and the presign-only serving pattern matter.
+
+--------------------------------------------------------------------------------
+B6. WORKSTREAM B TESTS
+--------------------------------------------------------------------------------
+  tests/test_object_store.py     - put() dedupes identical content; key carries
+                                   tenant prefix; delete_tenant removes all and
+                                   ONLY that tenant's objects (seed two tenants)
+  tests/test_presign.py          - cross-tenant issuance raises; URL expires
+                                   (mock clock); audit row written per issuance
+  tests/test_profiles.py         - same code passes against MinIO (dev) and a
+                                   moto/S3 stub (CI)
+
+
+================================================================================
+WORKSTREAM C — SECURITY HARDENING
+================================================================================
+
+--------------------------------------------------------------------------------
+C1. PER-TENANT ENCRYPTION KEYS (envelope encryption) — P1
+--------------------------------------------------------------------------------
+One master key (KMS / env-injected in self-host), one derived DATA KEY per
+tenant. All tenant content encrypted with the tenant's data key.
+
+WHAT THIS BUYS:
+  - Breach blast radius = one tenant, not all.
+  - OFFBOARDING = CRYPTO-SHREDDING: delete the tenant's data key and their
+    data is cryptographically unrecoverable everywhere, including backups.
+    This is a sellable contractual promise.
+
+backend/security/
+├── __init__.py
+├── keyring.py             # master key load, per-tenant key derive/store
+├── envelope.py            # encrypt/decrypt with tenant data key
+└── shred.py               # tenant key deletion + attestation record
+
+FILE: backend/security/keyring.py
+```python
+import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+class TenantKeyring:
+    """
+    tenant_keys table: (tenant_id, wrapped_key bytea, created_at, active bool)
+    Data keys are stored ONLY wrapped (encrypted by the master key).
+    """
+
+    def __init__(self, db, master_key: bytes):
+        assert len(master_key) == 32
+        self.db = db
+        self.master = AESGCM(master_key)
+
+    def create_tenant_key(self, tenant_id: str) -> None:
+        data_key = AESGCM.generate_key(bit_length=256)
+        nonce = os.urandom(12)
+        wrapped = nonce + self.master.encrypt(nonce, data_key,
+                                              tenant_id.encode())
+        self.db.execute(
+            "INSERT INTO tenant_keys (tenant_id, wrapped_key, active) "
+            "VALUES (%s, %s, true)", (tenant_id, wrapped))
+
+    def get_tenant_key(self, tenant_id: str) -> bytes:
+        row = self.db.fetchone(
+            "SELECT wrapped_key FROM tenant_keys "
+            "WHERE tenant_id=%s AND active", (tenant_id,))
+        if not row:
+            raise KeyError(f"no active key for tenant {tenant_id}")
+        blob = row["wrapped_key"]
+        nonce, ct = blob[:12], blob[12:]
+        return self.master.decrypt(nonce, ct, tenant_id.encode())
+
+    def shred(self, tenant_id: str) -> None:
+        """Crypto-shred: after this, tenant data is unrecoverable."""
+        self.db.execute(
+            "UPDATE tenant_keys SET active=false, wrapped_key=NULL "
+            "WHERE tenant_id=%s", (tenant_id,))
+```
+
+RULE C-1: decrypted data keys live only in process memory for the duration of
+an operation. Never logged, never cached to disk, never in error messages.
+
+--------------------------------------------------------------------------------
+C2. POSTGRES ROW-LEVEL SECURITY — P1 (the structural tenant boundary)
+--------------------------------------------------------------------------------
+Application-level WHERE tenant_id=... is one forgotten clause from a lawsuit.
+RLS makes the DATABASE refuse cross-tenant reads even when app code is buggy.
+
+MIGRATION (apply to every tenant-scoped table — SourceFile, Email, NotionPage,
+GitHubItem, CustomDocument, BrainBlock, forecasts, drift_report, ...):
+```sql
+ALTER TABLE source_file ENABLE ROW LEVEL SECURITY;
+ALTER TABLE source_file FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON source_file
+  USING (tenant_id = current_setting('app.tenant_id')::text);
+```
+
+CONNECTION DISCIPLINE (in the DB client wrapper, one place only):
+```python
+def with_tenant(conn, tenant_id: str):
+    # parameterised; never string-formatted
+    conn.execute("SELECT set_config('app.tenant_id', %s, false)", (tenant_id,))
+    return conn
+```
+
+RULE C-2: the app's database role must NOT be table owner or superuser
+(owners bypass RLS unless FORCE is set — set FORCE anyway, and use a
+non-owner role regardless).
+
+--------------------------------------------------------------------------------
+C3. RATE LIMITING + BEHAVIOURAL ANOMALY DETECTION — anti-scraping
+--------------------------------------------------------------------------------
+Scrapers with valid credentials look like users who read TOO MUCH.
+
+  Layer 1 — hard rate limits (Redis sliding window):
+    document reads   : 60 / user / minute
+    search queries   : 30 / user / minute
+    presign issuance : 120 / user / hour, 2000 / tenant / hour
+    Return 429; log every limit hit to the audit stream.
+
+  Layer 2 — behavioural tripwire (daily job):
+    baseline = user's trailing-30-day p95 daily document reads
+    if today's reads > max(10 * baseline, 500):
+        lock the account (soft lock: sessions revoked, re-auth + admin
+        unlock required) and alert the tenant admin + internal security.
+
+backend/security/rate_limit.py  — Redis sliding-window middleware
+backend/security/anomaly.py     — the daily tripwire job
+
+--------------------------------------------------------------------------------
+C4. SANDBOXED DOCUMENT PARSER — P5
+--------------------------------------------------------------------------------
+Customers upload arbitrary PDFs/DOCX/images. Malicious documents targeting
+parser bugs are a classic, reliable attack class. Parsing must happen where an
+exploit lands the attacker in an empty room.
+
+SPEC (implementation may be a separate worker container):
+  - Dedicated parser worker process, separate container from the API.
+  - Runs as non-root, read-only filesystem except /tmp (tmpfs, size-capped).
+  - NO network access (network_mode: none / NetworkPolicy deny-all egress).
+  - NO credentials in environment. Input arrives as bytes on stdin or a
+    mounted read-only file; output (extracted text JSON) leaves on stdout.
+  - seccomp profile: default-deny, allow read/write/mmap/exit family only.
+  - Hard limits: 512MB memory, 60s CPU, then SIGKILL.
+  - The API side treats parser output as UNTRUSTED input: schema-validate
+    before it enters the pipeline.
+
+docker-compose sketch:
+```yaml
+parser_worker:
+  build: ./parser
+  network_mode: "none"
+  read_only: true
+  tmpfs: [/tmp:size=256m]
+  mem_limit: 512m
+  pids_limit: 64
+  security_opt:
+    - no-new-privileges:true
+    - seccomp:./parser/seccomp.json
+  user: "10001:10001"
+```
+
+--------------------------------------------------------------------------------
+C5. IMMUTABLE AUDIT LOG + BACKUP DRILLS
+--------------------------------------------------------------------------------
+AUDIT: append-only log of every document access and every presign issuance:
+  (ts, actor_user_id, tenant_id, action, object_key, source_ip, user_agent)
+  - Written to Postgres for query, AND shipped hourly to object storage under
+    audit/{tenant_id}/{date}.jsonl.gz with S3 Object Lock (WORM) enabled.
+  - Application servers have PUT-only credentials for the audit prefix.
+  This is both the forensic record and the defence exhibit.
+
+BACKUPS:
+  - Postgres: continuous WAL archiving + nightly base backup to object storage,
+    separate credentials from the app.
+  - Object storage: versioning ON; deletion protection via Object Lock on the
+    audit prefix.
+  - RULE C-3: a QUARTERLY restore drill into a scratch environment, verified by
+    checksum and a smoke query, recorded in the audit log. An untested backup
+    is a hope, not a backup — and ransomware against a company whose product IS
+    the customers' documents is an existential scenario.
+
+--------------------------------------------------------------------------------
+C6. COMPLIANCE RUNWAY (do now, cash in later)
+--------------------------------------------------------------------------------
+SOC 2 Type II gates finance-sector sales and requires MONTHS of demonstrated
+operation. Everything in this module doubles as SOC 2 evidence. Actions now:
+  - Turn on the audit shipping (C5) immediately — the observation window
+    starts when the evidence starts.
+  - Keep the DriftReport and promotion-gate records (Workstream A) — they are
+    change-management evidence.
+  - Document the restore drills (C5) — availability evidence.
+
+--------------------------------------------------------------------------------
+C7. WORKSTREAM C TESTS
+--------------------------------------------------------------------------------
+  tests/test_keyring.py         - shred() makes decryption fail permanently;
+                                  wrong-tenant AAD fails to decrypt
+  tests/test_rls.py             - with app role + tenant A context, tenant B
+                                  rows are invisible on EVERY protected table;
+                                  missing app.tenant_id context yields zero rows
+  tests/test_rate_limit.py      - limits enforce; 429s audited
+  tests/test_anomaly.py         - synthetic spike locks account, writes alert
+  tests/test_parser_sandbox.py  - parser container: egress blocked, filesystem
+                                  read-only, oversized/looping input killed at
+                                  limits, malformed output rejected by schema
+
+
+================================================================================
+FINAL CHECKLIST — MODULE IS DONE WHEN ALL ARE TRUE
+================================================================================
+  [ ] norm stats refit monthly, versioned, and version-locked to checkpoints
+  [ ] weekly DriftReport rows produced; alarm tenants flagged stale_model
+  [ ] challenger trained, shadowed, and promoted ONLY through the gate
+  [ ] every training run reconstructable: data as-of, stats versions, commit
+  [ ] all document bytes behind ObjectStore; zero direct SDK calls elsewhere
+  [ ] content-addressed keys deduping; tenant offboarding = prefix delete
+  [ ] documents served ONLY via 5-minute presigned URLs, every issuance audited
+  [ ] lifecycle tiering active in the bucket config
+  [ ] per-tenant envelope keys live; crypto-shred works and is tested
+  [ ] RLS enabled + FORCED on every tenant-scoped table; app role is non-owner
+  [ ] rate limits + behavioural tripwire live
+  [ ] parser worker sandboxed: no network, no creds, seccomp, hard limits
+  [ ] audit shipped hourly to WORM storage; PUT-only creds
+  [ ] one restore drill completed and recorded
+  [ ] all workstream tests passing
+
+================================================================================
+END OF SCALING MODULE SPECIFICATION
+================================================================================
