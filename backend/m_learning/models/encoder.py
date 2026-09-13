@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 from m_learning.models.layers import GRN, VariableSelectionNetwork
 
+# The encoder for the TFT model prediction agent frecasting with product quantile loss and probabilistic modeling. The encoder is a neural network that takes in a sequence of input features and produces a sequence of hidden states that capture the temporal dependencies in the data. The encoder consists of an LSTM layer for local structure, an interpretable attention mechanism for long-range dependencies, and various normalization and gating layers to improve training stability and performance. The output of the encoder is a per-timestep sequence of hidden states that can be used by the decoder to make predictions.
+
 
 class UniversalEncoder(nn.Module):
     """
