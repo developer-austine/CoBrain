@@ -87,6 +87,7 @@ export default function SourcesClient({
   const inputRef = useRef<HTMLInputElement>(null);
 
   // Refresh the list from the server (used after upload + for status polling).
+  // We use startTransition to avoid blocking the UI while fetching the list of uploaded sources. This allows the user to continue interacting with the page while the list is being updated in the background.
   const refresh = useCallback(() => {
     startTransition(async () => {
       try {
